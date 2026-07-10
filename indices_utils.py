@@ -38,12 +38,14 @@ def compute_temperature_indices(tas_da, tasmax_da, tasmin_da, start, end, temp_t
     tasmin_1d = spatial_mean(tasmin_da).sel(time=slice(start, end))
     tas_1d.attrs['units'] = tasmax_1d.attrs['units'] = tasmin_1d.attrs['units'] = 'K'
     out = {}
-    out['annual_mean_tas'] = float(xci.tg_mean(tas_1d, freq='YS').mean())
-    out['annual_mean_tasmax'] = float(xci.tx_mean(tasmax_1d, freq='YS').mean())
-    out['annual_mean_tasmin'] = float(xci.tn_mean(tasmin_1d, freq='YS').mean())
+    # annual_mean_*/monthly_mean_* are temperature values -> convert K to degC for display.
+    out['annual_mean_tas'] = float(xci.tg_mean(tas_1d, freq='YS').mean()) - 273.15
+    out['annual_mean_tasmax'] = float(xci.tx_mean(tasmax_1d, freq='YS').mean()) - 273.15
+    out['annual_mean_tasmin'] = float(xci.tn_mean(tasmin_1d, freq='YS').mean()) - 273.15
     monthly = xci.tg_mean(tas_1d, freq='MS')
-    out['monthly_mean_tas'] = monthly.groupby('time.month').mean().values.tolist()
+    out['monthly_mean_tas'] = (monthly.groupby('time.month').mean() - 273.15).values.tolist()
     for thr in temp_thresholds:
+        # day-count index, not a temperature value -> no unit conversion needed.
         cnt = xci.tx_days_above(tasmax_1d, thresh=f'{thr} degC', freq='MS')
         out[f'su_days_per_month_{thr:g}C'] = cnt.groupby('time.month').mean().values.tolist()
     return out

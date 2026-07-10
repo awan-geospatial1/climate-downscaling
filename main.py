@@ -5,8 +5,14 @@ from config import _CFG, DEFAULT_NQUANTILES, DEFAULT_QDM_GROUP, DEFAULT_WET_THRE
 from gee_utils import fetch_reference, fetch_cmip6, regrid_to_reference, clean_time_attrs
 from qdm_utils import train_qdm, apply_qdm, adjust_wet_day_frequency
 from indices_utils import compute_temperature_indices, compute_precipitation_indices, aggregate_across_models
-from plot_utils import plot_fan_chart, make_spatial_map
+from plot_utils import plot_fan_chart, make_spatial_map, make_index_panel
+from report_utils import write_excel_summary
 from xclim import indices as xci
+
+def _kelvin_to_celsius(da):
+    da_c = da - 273.15
+    da_c.attrs['units'] = 'degC'
+    return da_c
 
 def load_shapefile(shp_path, buffer_km):
     gdf = gpd.read_file(shp_path)
@@ -213,7 +219,11 @@ def run_pipeline(params):
                     rows.append([period, domain, idx_name, stats['mean'], stats['p10'], stats['p90'], headline])
     df = pd.DataFrame(rows, columns=['period','domain','index','mean','p10','p90','headline_value'])
     excel_path = os.path.join(out_dir, 'climate_indices_summary.xlsx')
-    df.to_excel(excel_path, index=False)
+    write_excel_summary(df, excel_path, meta={
+        'baseline_period': f'{b_start} to {b_end}',
+        'models': models,
+        'scenarios': scenarios,
+    })
     print(f"✅ Excel summary saved: {excel_path}")
     plot_fan_chart(hist_cache, corrected_grids, 'tas', 'Annual mean temperature (K)',
                    os.path.join(out_dir, 'fanchart_tas.png'), 'Temperature',
@@ -223,23 +233,39 @@ def run_pipeline(params):
                    scenarios, future_intervals, models)
     print("✅ Fan charts generated.")
     index_map = {
-        'annual_mean_tas': ('tas', lambda da: xci.tg_mean(da, freq='YS').mean(dim='time')),
-        'prcptot': ('pr', lambda da: xci.precip_accumulation(da, freq='YS').mean(dim='time')),
+        'annual_mean_tas': ('tas', 'Mean Annual Temperature', '°C', 'inferno',
+                            lambda da: _kelvin_to_celsius(xci.tg_mean(da, freq='YS').mean(dim='time'))),
+        'txx': ('tasmax', 'Annual Maximum Temperature (TXx)', '°C', 'inferno',
+                lambda da: _kelvin_to_celsius(xci.tx_max(da, freq='YS').mean(dim='time'))),
+        'tnn': ('tasmin', 'Annual Minimum Temperature (TNn)', '°C', 'inferno',
+                lambda da: _kelvin_to_celsius(xci.tn_min(da, freq='YS').mean(dim='time'))),
+        'prcptot': ('pr', 'Annual Total Wet-Day Precipitation (PRCPTOT)', 'mm', 'Blues',
+                    lambda da: xci.precip_accumulation(da, freq='YS').mean(dim='time')),
+        'rx5day': ('pr', 'Max 5-Day Precipitation (Rx5day)', 'mm', 'Blues',
+                   lambda da: xci.max_n_day_precipitation_amount(da, window=5, freq='YS').mean(dim='time')),
+        'sdii': ('pr', 'Simple Daily Intensity Index (SDII)', 'mm/wet-day', 'Blues',
+                 lambda da: xci.daily_pr_intensity(da, thresh='1 mm/day', freq='YS').mean(dim='time')),
+        'cwd': ('pr', 'Consecutive Wet Days (CWD)', 'days', 'Blues',
+                lambda da: xci.maximum_consecutive_wet_days(da, thresh='1 mm/day', freq='YS').mean(dim='time')),
     }
-    map_combos = [
-        (idx_name, var, reducer, scenario, tag)
-        for idx_name, (var, reducer) in index_map.items()
-        for scenario in scenarios
-        for _, _, _, tag in future_intervals
-    ]
-    for idx_name, var, reducer, scenario, tag in tqdm(map_combos, desc='Spatial maps'):
-        grids = corrected_grids.get(var, {}).get(scenario, {}).get(tag, {})
-        if not grids: continue
-        per_model = [reducer(da) for da in grids.values()]
-        ens_mean = xr.concat(per_model, dim='model').mean(dim='model')
-        out_path = os.path.join(var_dirs[var]['ensemble'], f'{idx_name}_{scenario}_{tag}_map.png')
-        make_spatial_map(ens_mean, geom_native, out_path,
-                         title=f'{idx_name} – {scenario.upper()} ({tag})')
-    print("✅ Spatial maps saved.")
+    for idx_name, (var, disp_name, cbar_label, cmap, reducer) in tqdm(index_map.items(), desc='Index panels'):
+        panel_grids = {}
+        for scenario in scenarios:
+            panel_grids[scenario] = {}
+            for _, _, _, tag in future_intervals:
+                grids = corrected_grids.get(var, {}).get(scenario, {}).get(tag, {})
+                if not grids:
+                    continue
+                per_model = [reducer(da) for da in grids.values()]
+                panel_grids[scenario][tag] = xr.concat(per_model, dim='model').mean(dim='model')
+        ref_grid = reducer(ref_cache[var]['ref'])
+        out_path = os.path.join(var_dirs[var]['ensemble'], f'{idx_name}_panel.png')
+        make_index_panel(
+            ref_grid, panel_grids, geom_native, out_path,
+            title=f'{idx_name.upper()} — {disp_name}',
+            subtitle='Reference (baseline) vs. CMIP6 ensemble mean, QDM bias-corrected',
+            cbar_label=cbar_label, cmap=cmap,
+        )
+    print("✅ Index panels saved.")
     print("\n🎉 PIPELINE COMPLETE!")
     return results

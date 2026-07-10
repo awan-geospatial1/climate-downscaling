@@ -110,7 +110,7 @@ Written to `output_dir`, organized per variable rather than dumped in one folder
 
 ```
 output_dir/
-├── climate_indices_summary.xlsx   # one row per index/period/domain: mean, p10, p90, headline stat
+├── climate_indices_summary.xlsx   # styled: colored header, unit column, domain/baseline shading
 ├── fanchart_tas.png                # historical + scenario spread over time
 ├── fanchart_pr.png
 ├── tas/
@@ -118,22 +118,44 @@ output_dir/
 │   ├── ssp585/qdm_tas_<model>_ssp585_<tag>.nc
 │   └── ensemble/
 │       ├── tas_<scenario>_<tag>_ensemble_mean.nc   # ensemble-mean grid across models
-│       └── annual_mean_tas_<scenario>_<tag>_map.png
-├── tasmax/  (same layout: ssp245/, ssp585/, ensemble/)
-├── tasmin/  (same layout: ssp245/, ssp585/, ensemble/)
+│       └── annual_mean_tas_panel.png               # Reference + scenario x period panel
+├── tasmax/  (same layout: ssp245/, ssp585/, ensemble/ -- includes txx_panel.png)
+├── tasmin/  (same layout: ssp245/, ssp585/, ensemble/ -- includes tnn_panel.png)
 └── pr/
     ├── ssp245/  ssp585/            # per-model NetCDFs
     └── ensemble/
         ├── pr_<scenario>_<tag>_ensemble_mean.nc
-        └── prcptot_<scenario>_<tag>_map.png
+        └── prcptot_panel.png, rx5day_panel.png, sdii_panel.png, cwd_panel.png
 ```
 
 - **`{variable}/{scenario}/`** — the individual bias-corrected NetCDF for each GCM, so you
   can inspect or reuse a single model's output without touching the rest.
 - **`{variable}/ensemble/`** — the model-ensemble mean NetCDF for each scenario/future
-  period, plus the spatial-map PNG built from that same ensemble mean.
-- Top-level `climate_indices_summary.xlsx` and the two fan charts stay at the root since
-  they already summarize across variables/scenarios.
+  period, plus one **panel PNG per climate index**: a centered "Reference (baseline)"
+  tile on top, then one row per scenario × one column per future period below, all
+  smoothed, clipped to your AOI shapefile, and sharing a single colorbar with a
+  Mean/P99 stat box on every tile. Indices covered: `annual_mean_tas`, `txx`
+  (annual max temperature), `tnn` (annual min temperature) under `tas/`, `tasmax/`,
+  `tasmin/` respectively; `prcptot`, `rx5day`, `sdii`, `cwd` under `pr/`.
+- Top-level `climate_indices_summary.xlsx` (see below) and the two fan charts stay at
+  the root since they already summarize across variables/scenarios.
+
+### Excel formatting
+
+`climate_indices_summary.xlsx` (built by `report_utils.py`) is a formatted workbook, not
+a bare data dump:
+- Teal header row, frozen so it stays visible while scrolling, with an autofilter.
+- A title/subtitle banner naming the baseline period, models, and scenarios used.
+- An added **Unit** column (°C, mm, or days — inferred from the index/domain) so every
+  number is self-describing.
+- Row shading: gray for `Baseline` rows (no ensemble spread), light red for temperature
+  indices, light blue for precipitation indices — with a one-line legend above the table.
+- The `Headline Value` column is bolded, since that's the single representative
+  statistic (mean/p10/p90, per your `headline_stat` config) most people will scan first.
+- Temperature values are now stored and displayed in °C (previously raw Kelvin).
+
+This is purely a representation layer — every number is exactly what the pipeline
+computed; nothing here changes a formula or a result, only how it's shown.
 
 ## Progress bars
 
@@ -162,6 +184,17 @@ current package versions:
    with `AttributeError: 'list' object has no attribute 'get'` as soon as any temperature
    or precipitation threshold was configured. Fixed by wrapping consistently, while
    still leaving `gev_return_levels` (a genuine nested dict) untouched.
+
+5. **`requirements.txt`** — the original `xsdba<0.4` pin caps `numpy<2.0`, but with
+   `pandas` left unpinned, pip installs the newest `pandas` (3.x), whose wheel needs
+   numpy's 2.x ABI even though its declared metadata bound (`numpy>=1.26`) doesn't
+   forbid numpy 1.x. Installing both together in the same environment silently produces
+   an ABI-incompatible combo and crashes with
+   `ValueError: numpy.dtype size changed, may indicate binary incompatibility` on the
+   very first `import pandas`. Fixed by widening the `xsdba` pin to `>=0.6,<1.0`, which
+   dropped the `numpy<2.0` cap — so numpy resolves to 2.x, matching what Colab's other
+   preinstalled packages (jax, opencv, etc.) already expect, instead of forcing a
+   downgrade that would destabilize them.
 
 `requirements.txt` pins `xclim`, `xsdba`, and `xee` to compatible ranges and adds
 `tqdm`; `run_interactive.ipynb` installs from `requirements.txt` (rather than a
