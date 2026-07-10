@@ -1,7 +1,7 @@
 earthengine-api>=1.1.0
 xarray>=2024.9.0
 xclim>=0.57,<0.62
-xsdba>=0.2,<0.4
+xsdba>=0.6,<1.0
 xee>=0.0.15
 netCDF4
 dask
