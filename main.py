@@ -1,4 +1,5 @@
-import os, re, itertools, pandas as pd, numpy as np, xarray as xr, geopandas as gpd
+import os, re, itertools, time, traceback, pandas as pd, numpy as np, xarray as xr, geopandas as gpd
+from datetime import datetime
 from tqdm.auto import tqdm
 from shapely.geometry import mapping
 from config import _CFG, DEFAULT_NQUANTILES, DEFAULT_QDM_GROUP, DEFAULT_WET_THRESH, DEFAULT_CHUNKS_LATLON
@@ -7,6 +8,7 @@ from qdm_utils import train_qdm, apply_qdm, adjust_wet_day_frequency
 from indices_utils import compute_temperature_indices, compute_precipitation_indices, aggregate_across_models
 from plot_utils import plot_fan_chart, make_spatial_map, make_index_panel
 from report_utils import write_excel_summary
+from logger_utils import setup_logger
 from xclim import indices as xci
 
 def _kelvin_to_celsius(da):
@@ -33,6 +35,33 @@ def load_shapefile(shp_path, buffer_km):
     return geom_native, geom_buffered, extent
 
 def run_pipeline(params):
+    """
+    Top-level entry point. Sets up the timestamped run log, executes the
+    pipeline, and logs total elapsed time (and the error/traceback on
+    failure) before re-raising.
+    """
+    out_dir = params['output_dir']
+    logger, log_path = setup_logger(out_dir)
+
+    start_time = datetime.now()
+    logger.info(f"Pipeline started at {start_time:%Y-%m-%d %H:%M:%S}")
+
+    try:
+        results = _run_pipeline(params, logger)
+    except Exception as e:
+        end_time = datetime.now()
+        logger.error(f"Pipeline FAILED after {end_time - start_time}: {e}")
+        logger.error(traceback.format_exc())
+        raise
+
+    end_time = datetime.now()
+    elapsed = end_time - start_time
+    logger.info(f"Pipeline finished successfully at {end_time:%Y-%m-%d %H:%M:%S} (elapsed: {elapsed})")
+
+    return results
+
+def _run_pipeline(params, logger):
+    """Core pipeline logic. Every notable step is timestamped in the log file."""
     import ee
     shp_path = params['shapefile_path']
     buffer_km = params.get('buffer_km', 25.0)
@@ -64,14 +93,14 @@ def run_pipeline(params):
     })
     try:
         ee.Initialize()
-        print("✅ GEE already initialised.")
+        logger.info("GEE already initialised.")
     except Exception:
         ee.Authenticate()
         ee.Initialize(project=gee_project_id)
-        print(f"✅ GEE initialised with project: {gee_project_id}")
+        logger.info(f"GEE initialised with project: {gee_project_id}")
     geom_native, geom_buffered, extent = load_shapefile(shp_path, buffer_km)
     region = ee.Geometry(mapping(geom_buffered))
-    print("✅ AOI prepared.")
+    logger.info("AOI prepared.")
     os.makedirs(out_dir, exist_ok=True)
     variables = ['tas', 'tasmax', 'tasmin', 'pr']
     for v in variables:
@@ -92,11 +121,15 @@ def run_pipeline(params):
         os.makedirs(ens_dir, exist_ok=True)
         var_dirs[v]['ensemble'] = ens_dir
     ref_cache = {}
+    step_start = time.time()
     for var in tqdm(variables, desc='Reference data (baseline)'):
         ref_cache[var] = fetch_reference(var, b_start, b_end, region, extent, _CFG[var])
+        logger.info(f"Fetched reference data for '{var}'.")
+    logger.info(f"Reference data step complete in {time.time() - step_start:.1f}s.")
     qdm_cache = {v:{} for v in variables}
     hist_cache = {v:{} for v in variables}
     train_combos = list(itertools.product(variables, models))
+    step_start = time.time()
     for var, model in tqdm(train_combos, desc='Training QDM (variable × model)'):
         cfg = _CFG[var]
         try:
@@ -112,8 +145,10 @@ def run_pipeline(params):
             if cfg['wet_adjust']:
                 corr = adjust_wet_day_frequency(ref_cache[var]['ref'], corr, thresh=wet_thresh)
             hist_cache[var][model] = corr
+            logger.info(f"QDM trained for {var}/{model}.")
         except Exception as e:
-            tqdm.write(f"⚠️ {var}/{model} QDM failed: {e}")
+            logger.warning(f"{var}/{model} QDM failed: {e}")
+    logger.info(f"QDM training step complete in {time.time() - step_start:.1f}s.")
     corrected_grids = {
         v: {s: {tag: {} for _, _, _, tag in future_intervals} for s in scenarios}
         for v in variables
@@ -126,6 +161,7 @@ def run_pipeline(params):
         for model in models
         if model in qdm_cache[var]
     ]
+    step_start = time.time()
     for var, scenario, start, end, label, tag, model in tqdm(proj_combos, desc='Future projections'):
         cfg = _CFG[var]
         try:
@@ -139,9 +175,10 @@ def run_pipeline(params):
             out_path = os.path.join(var_dirs[var][scenario], f'qdm_{var}_{model}_{scenario}_{tag}.nc')
             corr.load().to_netcdf(out_path)
             corrected_grids[var][scenario][tag][model] = corr
-            tqdm.write(f"💾 {var}/{model}/{scenario}/{tag} saved")
+            logger.info(f"Saved {var}/{model}/{scenario}/{tag} -> {out_path}")
         except Exception as e:
-            tqdm.write(f"⚠️ {var}/{model}/{scenario}/{tag} failed: {e}")
+            logger.warning(f"{var}/{model}/{scenario}/{tag} failed: {e}")
+    logger.info(f"Future projections step complete in {time.time() - step_start:.1f}s.")
     # --- Ensemble-mean NetCDFs (one per variable/scenario/future-interval) ---
     ens_combos = [
         (var, scenario, tag)
@@ -149,6 +186,7 @@ def run_pipeline(params):
         for scenario in scenarios
         for _, _, _, tag in future_intervals
     ]
+    step_start = time.time()
     for var, scenario, tag in tqdm(ens_combos, desc='Ensemble means'):
         model_das = corrected_grids[var][scenario][tag]
         if not model_das:
@@ -157,12 +195,16 @@ def run_pipeline(params):
         ens_mean = clean_time_attrs(ens_mean)
         out_path = os.path.join(var_dirs[var]['ensemble'], f'{var}_{scenario}_{tag}_ensemble_mean.nc')
         ens_mean.load().to_netcdf(out_path)
+        logger.info(f"Saved ensemble mean -> {out_path}")
+    logger.info(f"Ensemble means step complete in {time.time() - step_start:.1f}s.")
     results = {}
+    step_start = time.time()
     temp_baseline = compute_temperature_indices(ref_cache['tas']['ref'], ref_cache['tasmax']['ref'],
                                                 ref_cache['tasmin']['ref'], b_start, b_end, temp_thresholds)
     precip_baseline = compute_precipitation_indices(ref_cache['pr']['ref'], b_start, b_end,
                                                     precip_thresholds, wet_months, dry_months,
                                                     return_periods, n_boot)
+    logger.info(f"Baseline indices computed in {time.time() - step_start:.1f}s.")
     def _wrap_baseline(d):
         # Baseline has no ensemble spread, so mean/p10/p90 are all the same value.
         # gev_return_levels is already a dict of {T: {mean,p10,p90}} and must be
@@ -175,6 +217,7 @@ def run_pipeline(params):
         'precipitation': _wrap_baseline(precip_baseline),
     }
     index_combos = list(itertools.product(scenarios, future_intervals))
+    step_start = time.time()
     for scenario, (start, end, label, tag) in tqdm(index_combos, desc='Computing indices'):
         key = f'{scenario}_{tag}'
         temp_list, precip_list = [], []
@@ -195,6 +238,8 @@ def run_pipeline(params):
             'temperature': aggregate_across_models(temp_list, return_periods),
             'precipitation': aggregate_across_models(precip_list, return_periods)
         }
+        logger.info(f"Indices computed for {key}.")
+    logger.info(f"Future indices step complete in {time.time() - step_start:.1f}s.")
     rows = []
     for period, groups in results.items():
         for domain, idx_dict in groups.items():
@@ -224,14 +269,14 @@ def run_pipeline(params):
         'models': models,
         'scenarios': scenarios,
     })
-    print(f"✅ Excel summary saved: {excel_path}")
+    logger.info(f"Excel summary saved: {excel_path}")
     plot_fan_chart(hist_cache, corrected_grids, 'tas', 'Annual mean temperature (K)',
                    os.path.join(out_dir, 'fanchart_tas.png'), 'Temperature',
                    scenarios, future_intervals, models)
     plot_fan_chart(hist_cache, corrected_grids, 'pr', 'Annual total precipitation (mm)',
                    os.path.join(out_dir, 'fanchart_pr.png'), 'Precipitation',
                    scenarios, future_intervals, models)
-    print("✅ Fan charts generated.")
+    logger.info("Fan charts generated.")
     index_map = {
         'annual_mean_tas': ('tas', 'Mean Annual Temperature', '°C', 'inferno',
                             lambda da: _kelvin_to_celsius(xci.tg_mean(da, freq='YS').mean(dim='time'))),
@@ -248,6 +293,7 @@ def run_pipeline(params):
         'cwd': ('pr', 'Consecutive Wet Days (CWD)', 'days', 'Blues',
                 lambda da: xci.maximum_consecutive_wet_days(da, thresh='1 mm/day', freq='YS').mean(dim='time')),
     }
+    step_start = time.time()
     for idx_name, (var, disp_name, cbar_label, cmap, reducer) in tqdm(index_map.items(), desc='Index panels'):
         panel_grids = {}
         for scenario in scenarios:
@@ -266,6 +312,7 @@ def run_pipeline(params):
             subtitle='Reference (baseline) vs. CMIP6 ensemble mean, QDM bias-corrected',
             cbar_label=cbar_label, cmap=cmap,
         )
-    print("✅ Index panels saved.")
-    print("\n🎉 PIPELINE COMPLETE!")
+        logger.info(f"Index panel saved: {out_path}")
+    logger.info(f"Index panels step complete in {time.time() - step_start:.1f}s.")
+    logger.info("PIPELINE COMPLETE!")
     return results
