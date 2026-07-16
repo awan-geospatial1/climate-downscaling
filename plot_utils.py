@@ -1,12 +1,25 @@
+import os
+import numpy as np
+import xarray as xr
+import geopandas as gpd
 import matplotlib.pyplot as plt
-import xarray as xr, numpy as np, geopandas as gpd, os
-import rioxarray  # noqa: F401  -- required to register the .rio accessor on DataArray/Dataset
+from matplotlib.patches import PathPatch
+from matplotlib.path import Path
 from scipy.ndimage import gaussian_filter
-from shapely.geometry import mapping
+
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import cartopy.io.img_tiles as cimgt
+
 from indices_utils import spatial_mean
 from xclim import indices as xci
 
-SCENARIO_COLORS = {'ssp245':'#e8a33d', 'ssp370':'#8a8a8a', 'ssp585':'#7a1f2b'}
+SCENARIO_COLORS = {'ssp245': '#e8a33d', 'ssp370': '#8a8a8a', 'ssp585': '#7a1f2b'}
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Fan charts (unchanged — these were already working)
+# ──────────────────────────────────────────────────────────────────────────
 
 def annual_series_from_grids(hist_cache, corrected_grids, var, scenario=None, tag=None, model_list=None):
     out = {}
@@ -16,140 +29,172 @@ def annual_series_from_grids(hist_cache, corrected_grids, var, scenario=None, ta
             da = hist_cache.get(var, {}).get(model)
         else:
             da = corrected_grids.get(var, {}).get(scenario, {}).get(tag, {}).get(model)
-        if da is None: continue
+        if da is None:
+            continue
         annual = (xci.tg_mean(spatial_mean(da), freq='YS') if var != 'pr'
                   else xci.precip_accumulation(spatial_mean(da), freq='YS'))
         out[model] = (annual['time'].dt.year.values, annual.values)
     return out
 
+
 def plot_fan_chart(hist_cache, corrected_grids, var, ylabel, out_path, title,
-                   scenarios, future_intervals, model_list):
-    fig, ax = plt.subplots(figsize=(10,6))
+                    scenarios, future_intervals, model_list):
+    fig, ax = plt.subplots(figsize=(10, 6))
     hist_series = annual_series_from_grids(hist_cache, corrected_grids, var, scenario=None, tag=None, model_list=model_list)
     if hist_series:
-        years = sorted(set().union(*[set(y) for y,_ in hist_series.values()]))
+        years = sorted(set().union(*[set(y) for y, _ in hist_series.values()]))
         stacked = np.full((len(hist_series), len(years)), np.nan)
-        for i,(y,v) in enumerate(hist_series.values()):
-            idx = np.searchsorted(years, y); stacked[i, idx] = v
+        for i, (y, v) in enumerate(hist_series.values()):
+            idx = np.searchsorted(years, y)
+            stacked[i, idx] = v
         ax.plot(years, np.nanmean(stacked, axis=0), color='black', label='Historical')
-        ax.fill_between(years, np.nanpercentile(stacked,10,axis=0),
-                        np.nanpercentile(stacked,90,axis=0), color='gray', alpha=0.25)
+        ax.fill_between(years, np.nanpercentile(stacked, 10, axis=0),
+                         np.nanpercentile(stacked, 90, axis=0), color='gray', alpha=0.25)
+
     for scenario in scenarios:
         all_years, all_mean, all_p10, all_p90 = [], [], [], []
-        for start,end,label,tag in future_intervals:
+        for start, end, label, tag in future_intervals:
             series = annual_series_from_grids(hist_cache, corrected_grids, var, scenario, tag, model_list)
-            if not series: continue
-            years = sorted(set().union(*[set(y) for y,_ in series.values()]))
+            if not series:
+                continue
+            years = sorted(set().union(*[set(y) for y, _ in series.values()]))
             stacked = np.full((len(series), len(years)), np.nan)
-            for i,(y,v) in enumerate(series.values()):
-                idx = np.searchsorted(years, y); stacked[i, idx] = v
+            for i, (y, v) in enumerate(series.values()):
+                idx = np.searchsorted(years, y)
+                stacked[i, idx] = v
             all_years.extend(years)
             all_mean.extend(np.nanmean(stacked, axis=0))
-            all_p10.extend(np.nanpercentile(stacked,10,axis=0))
-            all_p90.extend(np.nanpercentile(stacked,90,axis=0))
+            all_p10.extend(np.nanpercentile(stacked, 10, axis=0))
+            all_p90.extend(np.nanpercentile(stacked, 90, axis=0))
         if all_years:
             color = SCENARIO_COLORS.get(scenario)
             ax.plot(all_years, all_mean, color=color, label=scenario.upper())
             ax.fill_between(all_years, all_p10, all_p90, color=color, alpha=0.2)
-    ax.set_ylabel(ylabel); ax.set_title(title); ax.legend(); fig.tight_layout()
-    fig.savefig(out_path, dpi=150); plt.close(fig)
 
-def _smooth_and_clip(index_da_2d, geom_native, upsample_factor=4, smooth_sigma=1.0):
-    """Upsample a (lat,lon) grid, Gaussian-smooth it, then hard-clip to geom_native
-    (cells outside the boundary become NaN and are dropped from the bounding box).
-    Shared by make_spatial_map() and make_index_panel() so both produce identical
-    smoothing/masking behaviour."""
-    da = index_da_2d.rio.set_spatial_dims(x_dim='lon', y_dim='lat', inplace=False)
-    da = da.rio.write_crs('EPSG:4326')
-    new_lat = np.linspace(float(da.lat.min()), float(da.lat.max()), da.sizes['lat']*upsample_factor)
-    new_lon = np.linspace(float(da.lon.min()), float(da.lon.max()), da.sizes['lon']*upsample_factor)
-    da_fine = da.interp(lat=new_lat, lon=new_lon, method='linear')
-    smoothed = gaussian_filter(np.nan_to_num(da_fine.values, nan=np.nanmean(da_fine.values)), sigma=smooth_sigma)
-    da_smooth = xr.DataArray(smoothed, coords={'lat':new_lat,'lon':new_lon}, dims=['lat','lon'])
-    da_smooth = da_smooth.rio.set_spatial_dims(x_dim='lon', y_dim='lat').rio.write_crs('EPSG:4326')
-    da_clipped = da_smooth.rio.clip([mapping(geom_native)], crs='EPSG:4326', drop=True, all_touched=True)
-    return da_clipped
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Spatial maps — rebuilt on the contourf + polygon-clip approach that was
+# already proven to work in MappingfromNC.ipynb, instead of the rioxarray
+# reprojection/clip path that was silently producing no output.
+# ──────────────────────────────────────────────────────────────────────────
+
+def _polygon_to_mpl_path(geom):
+    """Convert a shapely Polygon/MultiPolygon into a matplotlib Path (incl. holes)."""
+    all_verts, all_codes = [], []
+
+    def process_ring(ring):
+        xy = np.array(ring.coords)
+        n = len(xy)
+        all_verts.append(xy)
+        all_codes.extend([Path.MOVETO] + [Path.LINETO] * (n - 2) + [Path.CLOSEPOLY])
+
+    def process_polygon(poly):
+        process_ring(poly.exterior)
+        for interior in poly.interiors:
+            process_ring(interior)
+
+    if geom.geom_type == 'Polygon':
+        process_polygon(geom)
+    elif geom.geom_type == 'MultiPolygon':
+        for poly in geom.geoms:
+            process_polygon(poly)
+    else:
+        raise ValueError(f"Unsupported geometry type for clipping: {geom.geom_type}")
+
+    return Path(np.vstack(all_verts), np.array(all_codes))
+
+
+def _smooth_field(data, sigma=1.0):
+    """Gap-aware gaussian smoothing — NaNs don't bleed into neighboring cells."""
+    mask = np.isnan(data)
+    filled = np.where(mask, 0.0, data)
+    sm = gaussian_filter(filled, sigma=sigma)
+    wt = gaussian_filter((~mask).astype(float), sigma=sigma)
+    with np.errstate(invalid='ignore'):
+        return np.where(wt > 0.01, sm / wt, np.nan)
+
+
+def _add_background(ax, add_satellite, tile_zoom):
+    """Satellite tiles if requested and reachable, else plain land/ocean fill.
+    Never raises — a background failure should not stop the map from saving.
+    """
+    if add_satellite:
+        try:
+            tiler = cimgt.GoogleTiles(
+                url="https://server.arcgisonline.com/ArcGIS/rest/services/"
+                    "World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                desired_tile_form="RGB")
+            ax.add_image(tiler, tile_zoom)
+            return
+        except Exception as e:
+            print(f"⚠️ Satellite tiles unavailable ({e}); falling back to plain background")
+
+    ax.set_facecolor('#dbe7f0')
+    ax.add_feature(cfeature.LAND, facecolor='#f2f0e8', zorder=0)
+    ax.add_feature(cfeature.OCEAN, facecolor='#dbe7f0', zorder=0)
+
 
 def make_spatial_map(index_da_2d, geom_native, out_path, title, cmap='viridis',
-                     smooth_sigma=1.0, upsample_factor=4):
-    da_clipped = _smooth_and_clip(index_da_2d, geom_native, upsample_factor, smooth_sigma)
-    fig, ax = plt.subplots(figsize=(7,6))
-    da_clipped.plot(ax=ax, cmap=cmap, add_colorbar=True)
-    gpd.GeoSeries([geom_native], crs='EPSG:4326').boundary.plot(ax=ax, color='black', linewidth=1)
-    ax.set_title(title); fig.tight_layout(); fig.savefig(out_path, dpi=150); plt.close(fig)
-
-def make_index_panel(ref_da, panel_grids, geom_native, out_path, title, subtitle,
-                     cbar_label, cmap='Blues', smooth_sigma=1.0, upsample_factor=4):
+                      smooth_sigma=1.0, add_satellite=False, tile_zoom=8):
     """
-    Build one 'AHP-style' panel figure for a single index: a centered Reference
-    (baseline) tile on top, then one row per scenario x one column per future
-    period below -- all smoothed, clipped to geom_native, and sharing one
-    colorbar, with a Mean/P99 stat box on every tile.
+    Render one clipped, smoothed spatial map from an in-memory (lat, lon)
+    DataArray and save it to out_path.
 
-    ref_da: 2D (lat,lon) ensemble grid for the reference/baseline period.
-    panel_grids: {scenario: {tag: 2D DataArray}} of ensemble-mean grids for
-                 each scenario x future-period combination.
+    index_da_2d : xr.DataArray with dims ('lat', 'lon')
+    geom_native : shapely Polygon/MultiPolygon (unbuffered AOI, EPSG:4326)
     """
-    scenarios = list(panel_grids.keys())
-    tags = sorted({tag for s in panel_grids.values() for tag in s.keys()})
-    if not tags:
-        tags = ['']
-    n_rows = 1 + len(scenarios)
-    n_cols = max(len(tags), 1)
+    da = index_da_2d.sortby('lat').sortby('lon')
+    lon = da['lon'].values
+    lat = da['lat'].values
+    vals_smooth = _smooth_field(da.values, sigma=smooth_sigma)
 
-    clipped_ref = _smooth_and_clip(ref_da, geom_native, upsample_factor, smooth_sigma)
-    clipped = {}
-    all_vals = [clipped_ref.values]
-    for s in scenarios:
-        clipped[s] = {}
-        for tag in tags:
-            da = panel_grids.get(s, {}).get(tag)
-            if da is None:
-                continue
-            c = _smooth_and_clip(da, geom_native, upsample_factor, smooth_sigma)
-            clipped[s][tag] = c
-            all_vals.append(c.values)
-    vmin = float(np.nanmin([np.nanmin(v) for v in all_vals]))
-    vmax = float(np.nanmax([np.nanmax(v) for v in all_vals]))
+    shp = gpd.GeoSeries([geom_native], crs='EPSG:4326')
+    minx, miny, maxx, maxy = shp.total_bounds
+    buf = 0.25
+    extent = [minx - buf, maxx + buf, miny - buf, maxy + buf]
 
-    fig = plt.figure(figsize=(4.2 * n_cols, 3.6 * n_rows + 1.2))
-    gs = fig.add_gridspec(n_rows, n_cols, hspace=0.4, wspace=0.15)
-    im = None
+    proj = ccrs.PlateCarree()
+    fig = plt.figure(figsize=(7, 6), facecolor='white')
+    ax = fig.add_subplot(1, 1, 1, projection=proj)
+    ax.set_extent(extent, crs=proj)
 
-    def _draw(ax, da, panel_title):
-        nonlocal im
-        im = da.plot(ax=ax, cmap=cmap, vmin=vmin, vmax=vmax, add_colorbar=False)
-        gpd.GeoSeries([geom_native], crs='EPSG:4326').boundary.plot(ax=ax, color='black', linewidth=0.8)
-        ax.set_title(panel_title, fontsize=10, fontweight='bold')
-        ax.set_xlabel(''); ax.set_ylabel(''); ax.set_xticks([]); ax.set_yticks([])
-        mean_v = float(np.nanmean(da.values))
-        p99_v = float(np.nanpercentile(da.values, 99))
-        ax.text(0.98, 0.03, f"Mean : {mean_v:.1f}\nP99 : {p99_v:.1f}", transform=ax.transAxes,
-                fontsize=7, color='white', ha='right', va='bottom',
-                bbox=dict(facecolor='black', alpha=0.55, boxstyle='round,pad=0.25'))
+    _add_background(ax, add_satellite, tile_zoom)
 
-    ref_col = (n_cols - 1) // 2
-    _draw(fig.add_subplot(gs[0, ref_col]), clipped_ref, 'Reference (baseline)')
-    for c in range(n_cols):
-        if c != ref_col:
-            fig.add_subplot(gs[0, c]).axis('off')
+    cf = ax.contourf(lon, lat, vals_smooth, levels=60, cmap=cmap,
+                      transform=proj, extend='both', zorder=3)
 
-    for r, s in enumerate(scenarios, start=1):
-        for c, tag in enumerate(tags):
-            ax = fig.add_subplot(gs[r, c])
-            da = clipped.get(s, {}).get(tag)
-            if da is None:
-                ax.axis('off')
-                continue
-            _draw(ax, da, tag)
-        fig.text(0.02, 1 - (r + 0.5) / n_rows, s.upper(), rotation=90,
-                 va='center', ha='center', fontsize=10, fontweight='bold')
+    # Clip strictly to the AOI polygon (this is the step that was failing
+    # silently under rioxarray — matplotlib-path clipping is what actually
+    # worked in the notebook).
+    clip_path = _polygon_to_mpl_path(geom_native)
+    patch = PathPatch(clip_path, transform=ax.transData)
+    artists = getattr(cf, 'collections', None) or [
+        a for a in cf.get_children() if hasattr(a, 'set_clip_path')
+    ]
+    for artist in artists:
+        artist.set_clip_path(patch)
 
-    if im is not None:
-        cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.6])
-        fig.colorbar(im, cax=cbar_ax, label=cbar_label)
+    shp.boundary.plot(ax=ax, color='black', linewidth=1.2, transform=proj, zorder=6)
 
-    fig.suptitle(title, fontsize=14, fontweight='bold', y=0.98)
-    fig.text(0.5, 0.955, subtitle, ha='center', fontsize=9, color='#555555')
-    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    gl = ax.gridlines(draw_labels=True, linewidth=0.4, color='grey', alpha=0.5,
+                       linestyle='--', crs=proj)
+    gl.top_labels = False
+    gl.right_labels = False
+
+    cb = fig.colorbar(cf, ax=ax, shrink=0.85, pad=0.03)
+    cb.ax.tick_params(labelsize=9)
+
+    ax.set_title(title, fontsize=11, fontweight='bold')
+    fig.tight_layout()
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close(fig)
+    print(f"🗺️  Map saved: {out_path}")
