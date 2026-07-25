@@ -16,3 +16,4 @@ pandas
 numpy
 ipywidgets
 tqdm
+cartopy
