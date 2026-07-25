@@ -1,10 +1,29 @@
-import numpy as np, xarray as xr
+import numpy as np, pandas as pd, xarray as xr
 from xclim import indices as xci
 from scipy.stats import genextreme
 
 def spatial_mean(da):
     dims = [d for d in ('lat','lon') if d in da.dims]
     return da.mean(dim=dims, skipna=True) if dims else da
+
+def daily_spatial_series(da, units=None):
+    """1-D pandas Series of the spatial mean of `da`, indexed by date.
+    Converts Kelvin to Celsius (units == 'K') for readability."""
+    s = spatial_mean(da).to_series()
+    if units == 'K':
+        s = s - 273.15
+    s.index = pd.to_datetime(s.index).normalize()
+    s.index.name = 'date'
+    return s
+
+def daily_spatial_ensemble(grids_by_model, units=None):
+    """Average the daily spatial-mean series across an ensemble of models
+    (a dict[model] -> xr.DataArray). Returns a pandas Series indexed by
+    date, or None if no models are present."""
+    if not grids_by_model:
+        return None
+    series_list = [daily_spatial_series(da, units) for da in grids_by_model.values()]
+    return pd.concat(series_list, axis=1).mean(axis=1)
 
 def gev_return_levels(annual_max_series, return_periods, n_boot=1000, random_state=42):
     rng = np.random.default_rng(random_state)

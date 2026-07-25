@@ -71,6 +71,21 @@ def fetch_cmip6(var, model, scenario, start_date, end_date, region, extent, cfg,
           .filter(ee.Filter.eq('model', model))
           .filter(ee.Filter.eq('scenario', scenario))
           .select(var))
+    # NEX-GDDP-CMIP6 does not provide every (model, scenario) combination —
+    # some models simply have no ssp245/ssp370/ssp585 run in the archive.
+    # Without this check, an empty ImageCollection silently propagates until
+    # something downstream (regrid/QDM) throws a vague, hard-to-diagnose
+    # error. Fail fast here with the real reason.
+    n_images = ic.filterDate(str(pd.to_datetime(start_date).date()),
+                              str((pd.to_datetime(end_date) + pd.DateOffset(days=1)).date())).size().getInfo()
+    if n_images == 0:
+        raise RuntimeError(
+            f"No NASA/GDDP-CMIP6 images for model='{model}', scenario='{scenario}' "
+            f"between {start_date} and {end_date}. This model may not have data for "
+            f"this scenario in the archive — try removing it from `models`, or check "
+            f"https://developers.google.com/earth-engine/datasets/catalog/NASA_GDDP-CMIP6 "
+            f"for which models cover this scenario."
+        )
     ds = _fetch_chunked(ic, start_date, end_date, proj, label=label)
     if cfg['cmip6_unit_factor'] != 1.0:
         ds[var] = ds[var] * cfg['cmip6_unit_factor']

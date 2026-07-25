@@ -1,11 +1,12 @@
-import os, pandas as pd, numpy as np, xarray as xr, geopandas as gpd
+import os, traceback, pandas as pd, numpy as np, xarray as xr, geopandas as gpd
 from shapely.geometry import mapping
 
 from config import _CFG, DEFAULT_NQUANTILES, DEFAULT_QDM_GROUP, DEFAULT_WET_THRESH, DEFAULT_CHUNKS_LATLON
 from gee_utils import fetch_reference, fetch_cmip6, regrid_to_reference, clean_time_attrs
 from qdm_utils import train_qdm, apply_qdm, adjust_wet_day_frequency
-from indices_utils import compute_temperature_indices, compute_precipitation_indices, aggregate_across_models
-from plot_utils import plot_fan_chart, make_spatial_map
+from indices_utils import (compute_temperature_indices, compute_precipitation_indices, aggregate_across_models,
+                           daily_spatial_series, daily_spatial_ensemble)
+from plot_utils import plot_fan_chart, make_spatial_map, plot_index_comparison
 from xclim import indices as xci
 
 
@@ -75,8 +76,32 @@ def run_pipeline(params):
     print("✅ AOI prepared.")
 
     os.makedirs(out_dir, exist_ok=True)
-    maps_dir = os.path.join(out_dir, 'spatial_maps')
-    os.makedirs(maps_dir, exist_ok=True)
+
+    # ── Output folder layout ────────────────────────────────────────────
+    # out_dir/
+    #   Baseline/tables/
+    #   <scenario>/<tag>/data/     ← corrected netCDF grids
+    #   <scenario>/<tag>/maps/     ← spatial maps for that scenario+period
+    #   <scenario>/tables/         ← per-scenario CSV summary
+    #   tables/                    ← master Excel summary (all scenarios/periods)
+    #   graphs/                   ← fan charts + scenario-comparison bar charts
+    tables_dir = os.path.join(out_dir, 'tables')
+    graphs_dir = os.path.join(out_dir, 'graphs')
+    baseline_tables_dir = os.path.join(out_dir, 'Baseline', 'tables')
+    for d in (tables_dir, graphs_dir, baseline_tables_dir):
+        os.makedirs(d, exist_ok=True)
+
+    def scenario_period_dirs(scenario, tag):
+        data_dir = os.path.join(out_dir, scenario, tag, 'data')
+        maps_dir = os.path.join(out_dir, scenario, tag, 'maps')
+        os.makedirs(data_dir, exist_ok=True)
+        os.makedirs(maps_dir, exist_ok=True)
+        return data_dir, maps_dir
+
+    def scenario_tables_dir(scenario):
+        d = os.path.join(out_dir, scenario, 'tables')
+        os.makedirs(d, exist_ok=True)
+        return d
 
     variables = ['tas', 'tasmax', 'tasmin', 'pr']
     for v in variables:
@@ -107,6 +132,7 @@ def run_pipeline(params):
                 hist_cache[var][model] = corr
             except Exception as e:
                 print(f"⚠️ {var}/{model} QDM failed: {e}")
+                traceback.print_exc()
 
     corrected_grids = {v: {} for v in variables}
     for var in variables:
@@ -126,12 +152,14 @@ def run_pipeline(params):
                         if cfg['wet_adjust']:
                             corr = adjust_wet_day_frequency(ref_cache[var]['ref'], corr, thresh=wet_thresh)
                         corr = clean_time_attrs(corr)
-                        out_path = os.path.join(out_dir, f'qdm_{var}_{model}_{scenario}_{tag}.nc')
+                        data_dir, _ = scenario_period_dirs(scenario, tag)
+                        out_path = os.path.join(data_dir, f'qdm_{var}_{model}.nc')
                         corr.load().to_netcdf(out_path)
                         corrected_grids[var][scenario][tag][model] = corr
-                        print(f"💾 {var}/{model}/{scenario}/{tag} saved")
+                        print(f"💾 {var}/{model}/{scenario}/{tag} saved → {out_path}")
                     except Exception as e:
                         print(f"⚠️ {var}/{model}/{scenario}/{tag} failed: {e}")
+                        traceback.print_exc()
 
     results = {}
     temp_baseline = compute_temperature_indices(ref_cache['tas']['ref'], ref_cache['tasmax']['ref'],
@@ -187,17 +215,105 @@ def run_pipeline(params):
                     rows.append([period, domain, idx_name, stats['mean'], stats['p10'], stats['p90'], headline])
 
     df = pd.DataFrame(rows, columns=['period', 'domain', 'index', 'mean', 'p10', 'p90', 'headline_value'])
-    excel_path = os.path.join(out_dir, 'climate_indices_summary.xlsx')
+    excel_path = os.path.join(tables_dir, 'climate_indices_summary.xlsx')
     df.to_excel(excel_path, index=False)
-    print(f"✅ Excel summary saved: {excel_path}")
+    print(f"✅ Master Excel summary saved: {excel_path}")
 
-    plot_fan_chart(hist_cache, corrected_grids, 'tas', 'Annual mean temperature (K)',
-                   os.path.join(out_dir, 'fanchart_tas.png'), 'Temperature',
-                   scenarios, future_intervals, models)
-    plot_fan_chart(hist_cache, corrected_grids, 'pr', 'Annual total precipitation (mm)',
-                   os.path.join(out_dir, 'fanchart_pr.png'), 'Precipitation',
-                   scenarios, future_intervals, models)
-    print("✅ Fan charts generated.")
+    # Per-scenario CSV (all periods for that scenario) + a Baseline CSV
+    baseline_csv = os.path.join(baseline_tables_dir, 'baseline_summary.csv')
+    df[df['period'] == 'Baseline'].to_csv(baseline_csv, index=False)
+    print(f"✅ Baseline table saved: {baseline_csv}")
+    for scenario in scenarios:
+        scen_df = df[df['period'].str.startswith(f'{scenario}_')]
+        if scen_df.empty:
+            continue
+        scen_csv = os.path.join(scenario_tables_dir(scenario), f'{scenario}_summary.csv')
+        scen_df.to_csv(scen_csv, index=False)
+        print(f"✅ {scenario} table saved: {scen_csv}")
+
+    # ── Daily spatial-average Excel ─────────────────────────────────────
+    # One sheet per period (Baseline obs, historical bias-corrected ensemble,
+    # and each scenario/future-period), each with one column per variable:
+    # the daily spatial (area) mean across the AOI, ensemble-averaged across
+    # models where relevant. Temperatures are converted K → °C for readability.
+    daily_path = os.path.join(tables_dir, 'daily_spatial_averages.xlsx')
+    sheets = {}
+
+    base_cols = {}
+    for var in variables:
+        try:
+            base_cols[var] = daily_spatial_series(ref_cache[var]['ref'], _CFG[var]['ref_units'])
+        except Exception as e:
+            print(f"⚠️ daily baseline series for {var} failed: {e}")
+    if base_cols:
+        sheets['Baseline_obs'] = pd.DataFrame(base_cols)
+
+    hist_cols = {}
+    for var in variables:
+        try:
+            s = daily_spatial_ensemble(hist_cache[var], _CFG[var]['ref_units'])
+            if s is not None:
+                hist_cols[var] = s
+        except Exception as e:
+            print(f"⚠️ daily historical-corrected series for {var} failed: {e}")
+    if hist_cols:
+        sheets['Historical_corrected'] = pd.DataFrame(hist_cols)
+
+    for scenario in scenarios:
+        for start, end, label, tag in future_intervals:
+            cols = {}
+            for var in variables:
+                try:
+                    s = daily_spatial_ensemble(corrected_grids[var][scenario][tag], _CFG[var]['ref_units'])
+                    if s is not None:
+                        cols[var] = s
+                except Exception as e:
+                    print(f"⚠️ daily series for {var}/{scenario}/{tag} failed: {e}")
+            if cols:
+                sheets[f'{scenario}_{tag}'[:31]] = pd.DataFrame(cols)  # Excel sheet-name length limit
+
+    if sheets:
+        try:
+            with pd.ExcelWriter(daily_path, engine='openpyxl') as writer:
+                for sheet_name, sheet_df in sheets.items():
+                    sheet_df.to_excel(writer, sheet_name=sheet_name)
+            print(f"✅ Daily spatial-average Excel saved ({len(sheets)} sheet(s)): {daily_path}")
+        except Exception as e:
+            print(f"⚠️ Daily spatial-average Excel failed: {e}")
+            traceback.print_exc()
+    else:
+        print("❌ Daily spatial-average Excel not written — no data available for any period.")
+
+    try:
+        plot_fan_chart(hist_cache, corrected_grids, 'tas', 'Annual mean temperature (K)',
+                       os.path.join(graphs_dir, 'fanchart_tas.png'), 'Temperature',
+                       scenarios, future_intervals, models)
+    except Exception as e:
+        print(f"⚠️ fanchart_tas.png failed: {e}")
+        traceback.print_exc()
+    try:
+        plot_fan_chart(hist_cache, corrected_grids, 'pr', 'Annual total precipitation (mm)',
+                       os.path.join(graphs_dir, 'fanchart_pr.png'), 'Precipitation',
+                       scenarios, future_intervals, models)
+    except Exception as e:
+        print(f"⚠️ fanchart_pr.png failed: {e}")
+        traceback.print_exc()
+    for fname in ('fanchart_tas.png', 'fanchart_pr.png'):
+        fpath = os.path.join(graphs_dir, fname)
+        print(f"{'✅' if os.path.exists(fpath) else '❌'} {fname} {'exists' if os.path.exists(fpath) else 'was NOT created'}")
+
+    # ── Scenario-comparison bar charts ──────────────────────────────────
+    comparison_indices = ['annual_mean_tas', 'annual_mean_tasmax', 'annual_mean_tasmin',
+                           'prcptot', 'wet_season_total', 'dry_season_total']
+    charts_made = 0
+    for idx_name in comparison_indices:
+        try:
+            if plot_index_comparison(df, idx_name, os.path.join(graphs_dir, f'compare_{idx_name}.png')):
+                charts_made += 1
+        except Exception as e:
+            print(f"⚠️ compare_{idx_name}.png failed: {e}")
+            traceback.print_exc()
+    print(f"✅ {charts_made} scenario-comparison bar charts saved → {graphs_dir}")
 
     # ── Spatial maps ────────────────────────────────────────────────────
     # NOTE: reducers here must return a 2D (lat, lon) DataArray.
@@ -218,6 +334,7 @@ def run_pipeline(params):
                 try:
                     per_model = [reducer(da) for da in grids.values()]
                     ens_mean = xr.concat(per_model, dim='model').mean(dim='model')
+                    _, maps_dir = scenario_period_dirs(scenario, tag)
                     out_path = os.path.join(maps_dir, f'{idx_name}_{scenario}_{tag}.png')
                     make_spatial_map(ens_mean, geom_native, out_path,
                                       title=f'{idx_name} – {scenario.upper()} ({tag})',
@@ -225,13 +342,27 @@ def run_pipeline(params):
                     maps_made += 1
                 except Exception as e:
                     maps_skipped.append(f'{idx_name}/{scenario}/{tag} (map generation failed: {e})')
+                    traceback.print_exc()
 
     if maps_made:
-        print(f"✅ Spatial maps saved: {maps_made} → {maps_dir}")
+        print(f"✅ Spatial maps saved: {maps_made}")
     else:
         print("❌ No spatial maps were generated.")
     for reason in maps_skipped:
         print(f"   ⚠️ skipped: {reason}")
+
+    # ── Data-availability summary ────────────────────────────────────────
+    # Pinpoints exactly which scenario/period/variable combo had 0 models
+    # succeed, which is the #1 reason maps silently don't get made — instead
+    # of scrolling back through every ⚠️ line above.
+    print("\n📊 Data availability summary:")
+    for var in variables:
+        print(f"   {var}: historical QDM trained on {len(qdm_cache[var])}/{len(models)} model(s)")
+        for scenario in scenarios:
+            for start, end, label, tag in future_intervals:
+                n = len(corrected_grids[var][scenario][tag])
+                flag = '' if n > 0 else '  ⚠️ 0 models succeeded — this is why maps/graphs for this combo are empty; see traceback above'
+                print(f"      {scenario}/{tag}: {n}/{len(models)} model(s){flag}")
 
     print("\n🎉 PIPELINE COMPLETE!")
     return results
