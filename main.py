@@ -7,6 +7,9 @@ from qdm_utils import train_qdm, apply_qdm, adjust_wet_day_frequency
 from indices_utils import (compute_temperature_indices, compute_precipitation_indices, aggregate_across_models,
                            daily_spatial_series, daily_spatial_ensemble)
 from plot_utils import plot_fan_chart, make_spatial_map, plot_index_comparison
+from ensemble_utils import compute_ensemble_mean, compute_ensemble_max, save_ensemble_netcdf
+from agreement_utils import make_agreement_sensitivity_maps
+from template_excel_utils import write_template_style_excel
 from xclim import indices as xci
 
 
@@ -94,9 +97,11 @@ def run_pipeline(params):
     def scenario_period_dirs(scenario, tag):
         data_dir = os.path.join(out_dir, scenario, tag, 'data')
         maps_dir = os.path.join(out_dir, scenario, tag, 'maps')
+        ensemble_dir = os.path.join(out_dir, scenario, tag, 'ensemble')
         os.makedirs(data_dir, exist_ok=True)
         os.makedirs(maps_dir, exist_ok=True)
-        return data_dir, maps_dir
+        os.makedirs(ensemble_dir, exist_ok=True)
+        return data_dir, maps_dir, ensemble_dir
 
     def scenario_tables_dir(scenario):
         d = os.path.join(out_dir, scenario, 'tables')
@@ -152,7 +157,7 @@ def run_pipeline(params):
                         if cfg['wet_adjust']:
                             corr = adjust_wet_day_frequency(ref_cache[var]['ref'], corr, thresh=wet_thresh)
                         corr = clean_time_attrs(corr)
-                        data_dir, _ = scenario_period_dirs(scenario, tag)
+                        data_dir, _, _ = scenario_period_dirs(scenario, tag)
                         out_path = os.path.join(data_dir, f'qdm_{var}_{model}.nc')
                         corr.load().to_netcdf(out_path)
                         corrected_grids[var][scenario][tag][model] = corr
@@ -161,15 +166,69 @@ def run_pipeline(params):
                         print(f"⚠️ {var}/{model}/{scenario}/{tag} failed: {e}")
                         traceback.print_exc()
 
+                # ── Ensemble mean (every variable) + ensemble max (pr only) ──
+                # Previously the pipeline never persisted a general
+                # per-variable ensemble grid -- only two hardcoded spatial-
+                # map indices got an in-memory, throwaway ensemble mean.
+                # This saves an actual ensemble_mean_<var>.nc for every
+                # variable/scenario/period (matching what the README already
+                # documented as part of the output layout, but main.py never
+                # actually produced), plus an ensemble_max_pr.nc for
+                # precipitation specifically -- the elementwise maximum
+                # across models at every cell/day, useful for extreme-value
+                # / hazard-style analysis (see Max_Precip / Return Period
+                # Graphs in the Excel report below), which a mean grid isn't
+                # meant for.
+                grids = corrected_grids[var][scenario][tag]
+                if grids:
+                    _, _, ensemble_dir = scenario_period_dirs(scenario, tag)
+                    try:
+                        ens_mean = compute_ensemble_mean(grids)
+                        mean_path = os.path.join(ensemble_dir, f'ensemble_mean_{var}.nc')
+                        save_ensemble_netcdf(ens_mean, mean_path, units=cfg['ref_units'])
+                        print(f"📊 Ensemble mean saved ({len(grids)} model(s)) → {mean_path}")
+                    except Exception as e:
+                        print(f"⚠️ Ensemble mean for {var}/{scenario}/{tag} failed: {e}")
+                        traceback.print_exc()
+
+                    if var == 'pr':
+                        try:
+                            ens_max = compute_ensemble_max(grids)
+                            max_path = os.path.join(ensemble_dir, f'ensemble_max_{var}.nc')
+                            save_ensemble_netcdf(ens_max, max_path, units=cfg['ref_units'])
+                            print(f"📊 Ensemble max saved ({len(grids)} model(s)) → {max_path}")
+                        except Exception as e:
+                            print(f"⚠️ Ensemble max for {var}/{scenario}/{tag} failed: {e}")
+                            traceback.print_exc()
+                else:
+                    print(f"⚠️ No models succeeded for {var}/{scenario}/{tag} — "
+                          f"skipping ensemble mean/max (nothing to aggregate).")
+
     results = {}
     temp_baseline = compute_temperature_indices(ref_cache['tas']['ref'], ref_cache['tasmax']['ref'],
                                                  ref_cache['tasmin']['ref'], b_start, b_end, temp_thresholds)
     precip_baseline = compute_precipitation_indices(ref_cache['pr']['ref'], b_start, b_end,
                                                       precip_thresholds, wet_months, dry_months,
                                                       return_periods, n_boot)
+
+    # FIX (pre-existing bug, not introduced by anything above): this used to
+    # wrap SCALAR baseline values into {'mean','p10','p90'} but leave
+    # LIST-valued ones (monthly_mean_tas, wetdays_per_month_*mm,
+    # su_days_per_month_*C) as raw lists. Every scenario/period gets those
+    # same list-valued indices wrapped into {'mean','p10','p90'} dicts by
+    # aggregate_across_models() -- so Baseline was the only period with a
+    # different shape for the same index. The rows-building loop below
+    # unconditionally calls `stats.get('mean')`, which crashes with
+    # AttributeError on a raw list -- this reliably crashed on every real
+    # run, since monthly_mean_tas is always present. Only gev_return_levels
+    # (itself a dict, keyed by return period) should stay unwrapped, since
+    # the rows loop already special-cases that one by its raw shape.
+    def _wrap_baseline_index(v):
+        return v if isinstance(v, dict) else {'mean': v, 'p10': v, 'p90': v}
+
     results['Baseline'] = {
-        'temperature': {k: {'mean': v, 'p10': v, 'p90': v} if not isinstance(v, list) else v for k, v in temp_baseline.items()},
-        'precipitation': {k: {'mean': v, 'p10': v, 'p90': v} if isinstance(v, (int, float)) else v for k, v in precip_baseline.items()}
+        'temperature': {k: _wrap_baseline_index(v) for k, v in temp_baseline.items()},
+        'precipitation': {k: _wrap_baseline_index(v) for k, v in precip_baseline.items()}
     }
 
     for scenario in scenarios:
@@ -284,6 +343,26 @@ def run_pipeline(params):
     else:
         print("❌ Daily spatial-average Excel not written — no data available for any period.")
 
+    # ── Template-style Excel workbook ────────────────────────────────────
+    # A second workbook matching the layout requested (Daily Spatial
+    # Averages / Helper / Precipitation Stats and Graph / Max_Precip /
+    # Return Period Graphs / Temperature Stats and Graphs), built from the
+    # same corrected_grids/results this pipeline already computes. See
+    # template_excel_utils.py's module docstring for the two judgment
+    # calls made in there (ensemble-max definition, Gumbel vs. GEV) and
+    # what this version does and doesn't reproduce pixel-for-pixel from
+    # the original template (short version: all 6 sheets' DATA is real
+    # and correct; only 2 of the original's 13 native charts are included
+    # so far).
+    try:
+        template_path = os.path.join(tables_dir, 'template_style_report.xlsx')
+        write_template_style_excel(template_path, variables, _CFG, scenarios, future_intervals,
+                                    ref_cache, corrected_grids, results, precip_thresholds)
+        print(f"✅ Template-style Excel report saved: {template_path}")
+    except Exception as e:
+        print(f"⚠️ Template-style Excel report failed: {e}")
+        traceback.print_exc()
+
     try:
         plot_fan_chart(hist_cache, corrected_grids, 'tas', 'Annual mean temperature (K)',
                        os.path.join(graphs_dir, 'fanchart_tas.png'), 'Temperature',
@@ -334,7 +413,7 @@ def run_pipeline(params):
                 try:
                     per_model = [reducer(da) for da in grids.values()]
                     ens_mean = xr.concat(per_model, dim='model').mean(dim='model')
-                    _, maps_dir = scenario_period_dirs(scenario, tag)
+                    _, maps_dir, _ = scenario_period_dirs(scenario, tag)
                     out_path = os.path.join(maps_dir, f'{idx_name}_{scenario}_{tag}.png')
                     make_spatial_map(ens_mean, geom_native, out_path,
                                       title=f'{idx_name} – {scenario.upper()} ({tag})',
@@ -350,6 +429,32 @@ def run_pipeline(params):
         print("❌ No spatial maps were generated.")
     for reason in maps_skipped:
         print(f"   ⚠️ skipped: {reason}")
+
+    # ── Model agreement & sensitivity maps ──────────────────────────────
+    # For every variable/scenario/period: % of models agreeing on the
+    # direction of change vs baseline, inter-model spread, and
+    # signal-to-noise ratio. See agreement_utils.py's module docstring for
+    # what these mean; see the earlier AJK conversation for the fuller
+    # explanation this was originally built against.
+    agreement_maps_made = 0
+    for var in variables:
+        cfg = _CFG[var]
+        for scenario in scenarios:
+            for start, end, label, tag in future_intervals:
+                grids = corrected_grids.get(var, {}).get(scenario, {}).get(tag, {})
+                if len(grids) < 2:
+                    print(f"   ⚠️ agreement/sensitivity skipped for {var}/{scenario}/{tag}: "
+                          f"need >= 2 models, have {len(grids)}.")
+                    continue
+                try:
+                    _, maps_dir, _ = scenario_period_dirs(scenario, tag)
+                    agreement_maps_made += make_agreement_sensitivity_maps(
+                        var, cfg, scenario, tag, start, end, ref_cache[var]['ref'], grids,
+                        geom_native, maps_dir, make_spatial_map, add_satellite=add_satellite)
+                except Exception as e:
+                    print(f"⚠️ agreement/sensitivity maps for {var}/{scenario}/{tag} failed: {e}")
+                    traceback.print_exc()
+    print(f"✅ Model agreement/sensitivity maps saved: {agreement_maps_made}")
 
     # ── Data-availability summary ────────────────────────────────────────
     # Pinpoints exactly which scenario/period/variable combo had 0 models
