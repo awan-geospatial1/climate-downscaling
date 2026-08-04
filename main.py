@@ -66,13 +66,29 @@ def run_pipeline(params):
         'wetdays_per_month': 'mean', 'gev_return_level': 'p90',
     })
 
-    try:
-        ee.Initialize()
-        print("✅ GEE already initialised.")
-    except Exception:
-        ee.Authenticate()
-        ee.Initialize(project=gee_project_id)
-        print(f"✅ GEE initialised with project: {gee_project_id}")
+    # FIX (new capability, not a bug fix): the interactive ee.Authenticate()
+    # branch below opens a browser OAuth prompt -- fine for a person running
+    # cells by hand, but a scheduled/unattended Colab run has nobody there
+    # to click through it, and the run will just hang/fail. If the caller
+    # supplies a service account (params['gee_service_account'] +
+    # params['gee_key_data'], the JSON key's contents as a string), use
+    # that non-interactive path instead. Existing interactive callers are
+    # unaffected -- these two params are optional and default to None.
+    gee_service_account = params.get('gee_service_account')
+    gee_key_data = params.get('gee_key_data')
+
+    if gee_service_account and gee_key_data:
+        credentials = ee.ServiceAccountCredentials(gee_service_account, key_data=gee_key_data)
+        ee.Initialize(credentials=credentials, project=gee_project_id)
+        print(f"✅ GEE initialised via service account: {gee_service_account}")
+    else:
+        try:
+            ee.Initialize()
+            print("✅ GEE already initialised.")
+        except Exception:
+            ee.Authenticate()
+            ee.Initialize(project=gee_project_id)
+            print(f"✅ GEE initialised with project: {gee_project_id}")
 
     geom_native, geom_buffered, extent = load_shapefile(shp_path, buffer_km)
     region = ee.Geometry(mapping(geom_buffered))
