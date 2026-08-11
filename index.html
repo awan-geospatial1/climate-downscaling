@@ -1,0 +1,842 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Downscaling Runner — QDM / Earth Engine</title>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,500&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg: #0e1a22;
+    --bg-2: #0a1319;
+    --panel: #132531;
+    --panel-2: #0e1e28;
+    --line: #223846;
+    --line-soft: #1a2c38;
+    --ink: #eef4f2;
+    --ink-dim: #82a0ab;
+    --ink-faint: #4f6b76;
+    --teal: #5fb8a8;
+    --teal-dim: #2c5850;
+    --amber: #d9a860;
+    --rust: #cd6f5f;
+    --serif: "Newsreader", Georgia, serif;
+    --sans: "IBM Plex Sans", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", "SF Mono", Menlo, Consolas, monospace;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    min-height:100vh; background:var(--bg); color:var(--ink); font-family:var(--sans);
+    background-image:
+      radial-gradient(ellipse 900px 500px at 15% -10%, rgba(95,184,168,0.08), transparent 60%),
+      radial-gradient(ellipse 700px 500px at 100% 0%, rgba(217,168,96,0.05), transparent 60%);
+    background-attachment:fixed;
+  }
+
+  .contours{position:absolute; top:0; left:0; right:0; height:340px; z-index:0; opacity:0.55; pointer-events:none; overflow:hidden;}
+  .contours svg{width:100%; height:100%; display:block;}
+
+  .wrap{max-width:900px; margin:0 auto; padding: 56px 24px 90px; position:relative; z-index:1;}
+
+  .eyebrow{
+    font-family:var(--mono); font-size:11px; letter-spacing:.2em; text-transform:uppercase;
+    color:var(--teal); margin-bottom:14px; display:flex; align-items:center; gap:10px;
+  }
+  .eyebrow::after{content:""; flex:1; height:1px; background:linear-gradient(90deg, var(--line), transparent);}
+
+  h1{
+    font-family:var(--serif); font-weight:500; font-size:44px; line-height:1.08;
+    margin:0 0 14px; letter-spacing:-0.01em; max-width:16ch;
+  }
+  h1 em{font-style:italic; color:var(--teal); font-weight:500;}
+  .sub{
+    color:var(--ink-dim); font-size:15px; line-height:1.65; margin:0 0 48px; max-width:56ch;
+    font-family:var(--sans);
+  }
+
+  .step{
+    display:grid; grid-template-columns:44px 1fr; gap:20px; margin-bottom:6px;
+    position:relative;
+  }
+  .step-rail{
+    display:flex; flex-direction:column; align-items:center;
+  }
+  .step-num{
+    font-family:var(--serif); font-style:italic; font-size:20px; color:var(--teal);
+    width:44px; height:44px; border:1px solid var(--teal-dim); border-radius:50%;
+    display:flex; align-items:center; justify-content:center; flex:none; background:var(--panel-2);
+  }
+  .step-num.done{background:var(--teal); color:var(--bg-2); border-color:var(--teal); font-style:normal; font-weight:600;}
+  .step-line{width:1px; flex:1; background:var(--line); margin:6px 0; min-height:24px;}
+  .step:last-child .step-line{display:none;}
+
+  .step-body{padding-bottom:44px;}
+  .step-label{
+    font-family:var(--mono); font-size:11px; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--ink-faint); margin-bottom:4px;
+  }
+  .step-title{font-family:var(--sans); font-weight:600; font-size:17px; margin-bottom:14px; color:var(--ink);}
+
+  .card{
+    background:var(--panel); border:1px solid var(--line); border-radius:8px;
+    padding:20px 22px 22px;
+  }
+
+  label.field{
+    display:block; font-size:12.5px; color:var(--ink-dim); margin: 0 0 7px; font-family:var(--sans);
+  }
+  textarea, input[type=text]{
+    width:100%; background:var(--panel-2); border:1px solid var(--line); border-radius:5px;
+    color:var(--ink); font-family:var(--mono); font-size:12.5px; padding:11px 13px;
+    resize:vertical; outline:none; line-height:1.6;
+  }
+  textarea:focus, input[type=text]:focus{ border-color: var(--teal-dim); background:#0f2029; }
+  textarea.big{min-height:170px;}
+  textarea.small{min-height:76px;}
+
+  .hint{font-size:12px; color:var(--ink-faint); margin-top:10px; line-height:1.6; font-family:var(--sans);}
+  .hint code{background:var(--panel-2); padding:1px 6px; border-radius:4px; font-family:var(--mono); color:var(--teal); font-size:11px;}
+  .hint a{color:var(--teal);}
+
+  /* -- file upload -- */
+  .dropzone{
+    border:1px dashed var(--line); border-radius:6px; background:var(--panel-2);
+    padding:26px 20px; text-align:center; cursor:pointer; transition:border-color .15s ease, background .15s ease;
+  }
+  .dropzone:hover, .dropzone.drag{ border-color:var(--teal-dim); background:#0f2029; }
+  .dropzone input[type=file]{ display:none; }
+  .dropzone .dz-icon{ color:var(--teal); font-size:20px; margin-bottom:8px; }
+  .dropzone .dz-label{ font-family:var(--sans); font-size:13.5px; color:var(--ink-dim); }
+  .dropzone .dz-sub{ font-family:var(--mono); font-size:11px; color:var(--ink-faint); margin-top:6px; }
+  .file-chip{
+    display:inline-flex; align-items:center; gap:8px; margin-top:14px; padding:7px 12px;
+    background:var(--panel-2); border:1px solid var(--teal-dim); border-radius:6px;
+    font-family:var(--mono); font-size:12px; color:var(--teal);
+  }
+  .file-chip .remove{ cursor:pointer; color:var(--ink-faint); }
+  .file-chip .remove:hover{ color:var(--rust); }
+
+  /* -- options form -- */
+  .field-group{ margin-bottom:22px; }
+  .field-group:last-child{ margin-bottom:0; }
+  .field-group-title{
+    font-family:var(--mono); font-size:11px; letter-spacing:.1em; text-transform:uppercase;
+    color:var(--ink-faint); margin-bottom:10px;
+  }
+  .choice-grid{ display:flex; flex-wrap:wrap; gap:8px; }
+  .choice{
+    display:inline-flex; align-items:center; gap:7px; padding:7px 12px; border-radius:6px;
+    border:1px solid var(--line); background:var(--panel-2); cursor:pointer; user-select:none;
+    font-family:var(--sans); font-size:12.5px; color:var(--ink-dim); transition:all .12s ease;
+  }
+  .choice:hover{ border-color:var(--teal-dim); }
+  .choice input{ accent-color: var(--teal); margin:0; }
+  .choice.checked{ border-color:var(--teal); color:var(--ink); background:rgba(95,184,168,0.08); }
+  .choice-grid.months .choice{ padding:7px 10px; }
+
+  .two-col{ display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .two-col input[type=text]{ font-family:var(--sans); }
+  @media (max-width:520px){ .two-col{grid-template-columns:1fr;} }
+
+  .interval-row{
+    display:grid; grid-template-columns:1fr 1fr 1fr 1fr auto; gap:8px; margin-bottom:8px; align-items:center;
+  }
+  .interval-row input{ font-family:var(--sans); font-size:12px; padding:9px 10px; }
+  .iv-remove{
+    background:none; border:1px solid var(--line); color:var(--ink-faint); border-radius:5px;
+    width:32px; height:32px; cursor:pointer; flex:none;
+  }
+  .iv-remove:hover{ border-color:var(--rust); color:var(--rust); }
+  .add-interval{
+    font-family:var(--sans); font-size:12.5px; color:var(--teal); background:none; border:none;
+    cursor:pointer; padding:6px 0; margin-top:4px;
+  }
+  .add-interval:hover{ text-decoration:underline; }
+  @media (max-width:640px){ .interval-row{grid-template-columns:1fr 1fr; grid-template-areas:"a b" "c d" "e e";} }
+
+  details.advanced{ margin-top:22px; border-top:1px solid var(--line-soft); padding-top:16px; }
+  details.advanced summary{
+    cursor:pointer; font-family:var(--sans); font-size:12.5px; color:var(--ink-dim); list-style:none;
+  }
+  details.advanced summary::-webkit-details-marker{ display:none; }
+  details.advanced summary::before{ content:"▸ "; color:var(--teal); }
+  details.advanced[open] summary::before{ content:"▾ "; }
+  details.advanced textarea{ margin-top:12px; }
+
+  .btn{
+    appearance:none; border:1px solid var(--teal-dim); background:transparent; color:var(--teal);
+    font-family:var(--sans); font-weight:500; font-size:13px;
+    padding:12px 20px; border-radius:6px; cursor:pointer; transition: all .15s ease;
+  }
+  .btn:hover{ background:rgba(95,184,168,0.1); border-color:var(--teal); }
+  .btn:disabled{opacity:.35; cursor:not-allowed;}
+  .btn.solid{ background:var(--teal); color:var(--bg-2); border-color:var(--teal); font-weight:600; }
+  .btn.solid:hover{ filter:brightness(1.08); background:var(--teal); }
+
+  .connected-row{display:flex; align-items:center; gap:10px;}
+
+  .pill{
+    display:inline-flex; align-items:center; gap:7px; font-family:var(--mono); font-size:11.5px;
+    padding:5px 12px 5px 10px; border-radius:999px; border:1px solid var(--line); color:var(--ink-dim);
+    letter-spacing:.03em;
+  }
+  .pill .dot{width:6px;height:6px;border-radius:50%; background:var(--ink-faint); flex:none;}
+  .pill.idle .dot{background:var(--ink-faint);}
+  .pill.queued .dot{background:var(--amber);}
+  .pill.running .dot{background:var(--teal); box-shadow:0 0 7px var(--teal); animation:pulse 1.3s infinite;}
+  .pill.done .dot{background:var(--teal);}
+  .pill.done{color:var(--teal); border-color:var(--teal-dim);}
+  .pill.error .dot{background:var(--rust);}
+  .pill.error{color:var(--rust); border-color:#4a2e2a;}
+  @keyframes pulse{0%,100%{opacity:1} 50%{opacity:.3}}
+
+  .status-row{display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; flex-wrap:wrap; gap:12px;}
+  .job-name{font-family:var(--mono); font-size:11.5px; color:var(--ink-faint);}
+
+  .progress-wrap{ margin-bottom:22px; }
+  .progress-labels{ display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px; }
+  .progress-stage{ font-family:var(--sans); font-size:12.5px; color:var(--ink-dim); }
+  .progress-pct{ font-family:var(--mono); font-size:12px; color:var(--teal); }
+  .progress-track{
+    width:100%; height:10px; border-radius:6px; background:var(--panel-2);
+    border:1px solid var(--line); overflow:hidden;
+  }
+  .progress-fill{
+    height:100%; width:0%; border-radius:6px;
+    background:linear-gradient(90deg, var(--teal-dim), var(--teal));
+    transition:width .6s ease;
+  }
+  .progress-fill.error{ background:var(--rust); }
+
+  #log{
+    background:var(--bg-2); border:1px solid var(--line); border-radius:6px; padding:16px 18px;
+    font-family:var(--mono); font-size:12px; line-height:1.7; color:#a9cbc0;
+    max-height:380px; overflow-y:auto; white-space:pre-wrap; word-break:break-word;
+  }
+  #log:empty::before{ content:"Logs will stream here once a job starts running."; color:var(--ink-faint); font-style:italic; }
+  #log::-webkit-scrollbar{width:8px;}
+  #log::-webkit-scrollbar-thumb{background:var(--line); border-radius:4px;}
+
+  .setup-toggle{
+    font-family:var(--sans); font-size:12.5px; color:var(--ink-dim); cursor:pointer;
+    background:none; border:none; padding:0; display:inline-flex; align-items:center; gap:6px;
+  }
+  .setup-toggle:hover{color:var(--teal);}
+  .setup-toggle .chevron{transition:transform .15s ease; font-size:10px;}
+  .setup-toggle.open .chevron{transform:rotate(90deg);}
+  #setup-body{display:none; margin-top:16px; padding-top:16px; border-top:1px solid var(--line-soft);}
+  #setup-body ol{margin:0; padding-left:20px; font-size:13px; color:var(--ink-dim); line-height:1.9; font-family:var(--sans);}
+  #setup-body code{background:var(--panel-2); padding:1px 6px; border-radius:4px; font-family:var(--mono); color:var(--teal); font-size:11.5px;}
+
+  footer{
+    margin-top:56px; padding-top:20px; border-top:1px solid var(--line-soft);
+    font-size:11px; color:var(--ink-faint); font-family:var(--mono); letter-spacing:.03em;
+    display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px;
+  }
+
+  @media (max-width: 600px){
+    h1{font-size:32px;}
+    .step{grid-template-columns:36px 1fr; gap:14px;}
+    .step-num{width:36px;height:36px;font-size:16px;}
+  }
+</style>
+</head>
+<body>
+
+<div class="contours">
+  <svg viewBox="0 0 900 340" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M-50,120 C150,60 300,180 450,110 C600,40 750,140 950,90" fill="none" stroke="#5fb8a8" stroke-width="1" opacity="0.35"/>
+    <path d="M-50,170 C150,110 300,230 450,160 C600,90 750,190 950,140" fill="none" stroke="#5fb8a8" stroke-width="1" opacity="0.28"/>
+    <path d="M-50,220 C150,160 300,280 450,210 C600,140 750,240 950,190" fill="none" stroke="#5fb8a8" stroke-width="1" opacity="0.2"/>
+    <path d="M-50,270 C150,210 300,330 450,260 C600,190 750,290 950,240" fill="none" stroke="#5fb8a8" stroke-width="1" opacity="0.13"/>
+    <path d="M-50,70 C150,10 300,130 450,60 C600,-10 750,90 950,40" fill="none" stroke="#d9a860" stroke-width="1" opacity="0.18"/>
+  </svg>
+</div>
+
+<div class="wrap">
+
+  <div class="eyebrow">QDM · CMIP6 · Google Earth Engine</div>
+  <h1>Downscaling <em>runner</em></h1>
+  <p class="sub">Submit a bias-correction job here. It drops into your Drive, a Colab notebook
+    you leave open picks it up, and this page streams back its progress — no server to host or pay for.</p>
+
+  <div class="step">
+    <div class="step-rail"><div class="step-num" id="num-1">1</div><div class="step-line"></div></div>
+    <div class="step-body">
+      <div class="step-label">Setup</div>
+      <div class="step-title">Connect this app to your Drive</div>
+      <div class="card">
+        <div class="connected-row">
+          <button class="btn solid" id="signin-btn" onclick="signIn()">Connect Google Drive</button>
+          <div id="signed-in-panel" style="display:none;">
+            <span class="pill done"><span class="dot"></span> connected</span>
+          </div>
+        </div>
+        <button class="setup-toggle" id="setup-toggle" onclick="toggleSetup()">
+          <span class="chevron">▸</span> First time? Read the one-time Cloud Console setup
+        </button>
+        <div id="setup-body">
+          <ol>
+            <li>In <a href="https://console.cloud.google.com/" target="_blank">Google Cloud Console</a>, create or select a project and enable the <b>Google Drive API</b>.</li>
+            <li>Configure the OAuth consent screen as <b>External</b> + <b>Testing</b>, and add your own Google account under <b>Test users</b>.</li>
+            <li>Create an <b>OAuth 2.0 Client ID</b> (Web application). Add the exact URL you'll open this file from as an <b>Authorized JavaScript origin</b> — e.g. <code>http://localhost:8000</code>. <code>file://</code> URLs won't work with Google sign-in.</li>
+            <li>Paste that client ID into <code>CLIENT_ID</code> near the top of this file's <code>&lt;script&gt;</code> tag.</li>
+            <li>Serve the file locally, e.g. <code>python3 -m http.server 8000</code>, then open <code>http://localhost:8000/index.html</code>.</li>
+            <li>Open <code>colab_runner.ipynb</code> in Colab, run every cell, authorize Drive + Earth Engine, and leave that tab open — it polls for jobs every 10s.</li>
+          </ol>
+          <div class="hint">This uses the full <code>drive</code> scope rather than <code>drive.file</code>, because the web app and the notebook both need to see the same job folder regardless of which one wrote each file. Keep this for personal or small-team use — publishing it to the public would require Google's OAuth verification review.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-rail"><div class="step-num" id="num-2">2</div><div class="step-line"></div></div>
+    <div class="step-body">
+      <div class="step-label">Geometry</div>
+      <div class="step-title">Upload the area of interest</div>
+      <div class="card">
+        <label class="field">Shapefile, zipped</label>
+        <div class="dropzone" id="dropzone" onclick="document.getElementById('shp-input').click()">
+          <div class="dz-icon">⤒</div>
+          <div class="dz-label">Click to choose a .zip, or drop it here</div>
+          <div class="dz-sub">must contain .shp · .shx · .dbf · .prj</div>
+          <input type="file" id="shp-input" accept=".zip" onchange="onShpSelected(this.files[0])">
+        </div>
+        <div id="shp-chip"></div>
+        <div class="hint">Zip your shapefile's <code>.shp</code>, <code>.shx</code>, <code>.dbf</code>, and <code>.prj</code> together at the top level (not inside a subfolder) before uploading. It's read with geopandas on the notebook side, buffered by the amount set below, and clipped on Earth Engine.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-rail"><div class="step-num" id="num-3">3</div><div class="step-line"></div></div>
+    <div class="step-body">
+      <div class="step-label">Configuration</div>
+      <div class="step-title">Set the pipeline parameters</div>
+      <div class="card">
+
+        <div class="field-group">
+          <div class="field-group-title">Earth Engine</div>
+          <div class="two-col">
+            <div>
+              <label class="field">GEE project ID</label>
+              <input type="text" id="gee-project" placeholder="your-gee-project-id">
+            </div>
+            <div>
+              <label class="field">AOI buffer (km)</label>
+              <input type="text" id="buffer-km" value="25">
+            </div>
+          </div>
+        </div>
+
+        <div class="field-group">
+          <div class="field-group-title">CMIP6 models</div>
+          <div class="choice-grid" id="models-grid">
+            <!-- populated by JS -->
+          </div>
+          <label class="field" style="margin-top:12px;">Additional model IDs (comma-separated)</label>
+          <input type="text" id="models-custom" placeholder="e.g. TaiESM1, NESM3">
+        </div>
+
+        <div class="field-group">
+          <div class="field-group-title">Scenarios</div>
+          <div class="choice-grid" id="scenarios-grid"></div>
+        </div>
+
+        <div class="field-group">
+          <div class="field-group-title">Baseline period</div>
+          <div class="two-col">
+            <div>
+              <label class="field">Start</label>
+              <input type="text" id="baseline-start" value="1995-01-01">
+            </div>
+            <div>
+              <label class="field">End</label>
+              <input type="text" id="baseline-end" value="2014-12-31">
+            </div>
+          </div>
+          <label class="field" style="margin-top:12px;">Historical start (optional — defaults to baseline start)</label>
+          <input type="text" id="hist-start" placeholder="1985-01-01">
+        </div>
+
+        <div class="field-group">
+          <div class="field-group-title">Future intervals</div>
+          <div id="intervals-container"></div>
+          <button type="button" class="add-interval" onclick="addIntervalRow()">+ Add interval</button>
+        </div>
+
+        <div class="field-group">
+          <div class="field-group-title">Wet / dry season months</div>
+          <label class="field">Wet months</label>
+          <div class="choice-grid months" id="wet-months-grid"></div>
+          <label class="field" style="margin-top:12px;">Dry months</label>
+          <div class="choice-grid months" id="dry-months-grid"></div>
+        </div>
+
+        <div class="field-group">
+          <div class="field-group-title">Extreme value analysis</div>
+          <label class="field">Return periods (years)</label>
+          <div class="choice-grid" id="return-periods-grid"></div>
+          <div class="two-col" style="margin-top:12px;">
+            <div>
+              <label class="field">Custom return periods (comma-separated)</label>
+              <input type="text" id="custom-return-periods" placeholder="e.g. 20, 200">
+            </div>
+            <div>
+              <label class="field">Bootstrap iterations</label>
+              <input type="text" id="n-bootstrap" value="1000">
+            </div>
+          </div>
+        </div>
+
+        <div class="field-group">
+          <div class="field-group-title">QDM settings</div>
+          <div class="two-col">
+            <div>
+              <label class="field">Quantiles</label>
+              <input type="text" id="n-quantiles" value="50">
+            </div>
+            <div>
+              <label class="field">Wet-day threshold (mm)</label>
+              <input type="text" id="wet-thresh" value="0.1">
+            </div>
+          </div>
+        </div>
+
+        <details class="advanced">
+          <summary>Advanced: raw JSON overrides</summary>
+          <label class="field">Merged into the params after everything above — use for <code style="font-family:var(--mono); color:var(--teal); background:var(--panel-2); padding:1px 6px; border-radius:4px; font-size:11px;">temp_thresholds</code>, <code style="font-family:var(--mono); color:var(--teal); background:var(--panel-2); padding:1px 6px; border-radius:4px; font-size:11px;">precip_thresholds</code>, <code style="font-family:var(--mono); color:var(--teal); background:var(--panel-2); padding:1px 6px; border-radius:4px; font-size:11px;">headline_stat</code>, or anything else <code style="font-family:var(--mono); color:var(--teal); background:var(--panel-2); padding:1px 6px; border-radius:4px; font-size:11px;">run_pipeline</code> accepts</label>
+          <textarea id="advanced-json" class="small">{
+  "temp_thresholds": {},
+  "precip_thresholds": {}
+}</textarea>
+        </details>
+
+      </div>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-rail"><div class="step-num" id="num-4">4</div></div>
+    <div class="step-body">
+      <div class="step-label">Execution</div>
+      <div class="step-title">Submit and monitor</div>
+      <div class="card">
+        <button class="btn solid" id="run-btn" onclick="startJob()" disabled style="margin-bottom:24px;">Submit job to Drive</button>
+
+        <div class="status-row">
+          <span style="font-family:var(--mono); font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--ink-faint);">Status</span>
+          <span class="job-name" id="job-name">no job submitted yet</span>
+        </div>
+        <div style="margin-bottom:18px;"><span class="pill idle" id="status-pill"><span class="dot"></span> idle</span></div>
+
+        <div class="progress-wrap">
+          <div class="progress-labels">
+            <span class="progress-stage" id="progress-stage">Not started</span>
+            <span class="progress-pct" id="progress-pct">0%</span>
+          </div>
+          <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
+        </div>
+
+        <label class="field">Live log</label>
+        <div id="log"></div>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    <span>climate-downscaling · Drive-relay runner</span>
+    <span>logs refresh every 8s</span>
+  </footer>
+</div>
+
+<script>
+// ---- fill this in with your own OAuth client ID (see step 1 above) ----
+const CLIENT_ID = "381880083998-ivdhfq4923ojfes85rc44rttjol2rdaf.apps.googleusercontent.com";
+const SCOPE = "https://www.googleapis.com/auth/drive";
+
+let accessToken = null;
+let tokenClient = null;
+let currentJobFolderId = null;
+let pollTimer = null;
+let shpFile = null;
+
+// ---- option data for the choice grids ----
+const MODEL_OPTIONS = ["ACCESS-CM2","ACCESS-ESM1-5","CanESM5","CMCC-ESM2","CNRM-CM6-1",
+  "EC-Earth3","EC-Earth3-Veg","GFDL-ESM4","INM-CM5-0","IPSL-CM6A-LR",
+  "MIROC6","MPI-ESM1-2-HR","MRI-ESM2-0","NorESM2-MM","UKESM1-0-LL"];
+const SCENARIO_OPTIONS = [["ssp126","SSP1-2.6"],["ssp245","SSP2-4.5"],["ssp370","SSP3-7.0"],["ssp585","SSP5-8.5"]];
+const RETURN_PERIOD_OPTIONS = [5,10,25,50,100];
+const MONTH_OPTIONS = [["1","Jan"],["2","Feb"],["3","Mar"],["4","Apr"],["5","May"],["6","Jun"],
+  ["7","Jul"],["8","Aug"],["9","Sep"],["10","Oct"],["11","Nov"],["12","Dec"]];
+
+function buildChoiceGrid(containerId, name, options, defaults){
+  const el = document.getElementById(containerId);
+  el.innerHTML = options.map(opt => {
+    const [value, label] = Array.isArray(opt) ? opt : [opt, opt];
+    const checked = defaults.includes(value) ? 'checked' : '';
+    return `<label class="choice ${checked ? 'checked' : ''}">
+      <input type="checkbox" name="${name}" value="${value}" ${checked}
+        onchange="this.closest('.choice').classList.toggle('checked', this.checked)">
+      ${label}
+    </label>`;
+  }).join('');
+}
+
+function getCheckedValues(name){
+  return Array.from(document.querySelectorAll(`input[name="${name}"]:checked`)).map(el => el.value);
+}
+
+function addIntervalRow(start='', end='', label='', tag=''){
+  const container = document.getElementById('intervals-container');
+  const row = document.createElement('div');
+  row.className = 'interval-row';
+  row.innerHTML = `
+    <input type="text" class="iv-start" placeholder="Start YYYY-MM-DD" value="${start}">
+    <input type="text" class="iv-end" placeholder="End YYYY-MM-DD" value="${end}">
+    <input type="text" class="iv-label" placeholder="Label" value="${label}">
+    <input type="text" class="iv-tag" placeholder="Tag" value="${tag}">
+    <button type="button" class="iv-remove" onclick="this.parentElement.remove()">✕</button>`;
+  container.appendChild(row);
+}
+
+function buildFutureIntervals(){
+  return Array.from(document.querySelectorAll('.interval-row')).map(row => [
+    row.querySelector('.iv-start').value.trim(),
+    row.querySelector('.iv-end').value.trim(),
+    row.querySelector('.iv-label').value.trim(),
+    row.querySelector('.iv-tag').value.trim(),
+  ]).filter(iv => iv[0] && iv[1]);
+}
+
+function initOptionsForm(){
+  buildChoiceGrid('models-grid', 'models', MODEL_OPTIONS, ['ACCESS-CM2','MIROC6']);
+  buildChoiceGrid('scenarios-grid', 'scenarios', SCENARIO_OPTIONS, ['ssp245','ssp585']);
+  buildChoiceGrid('return-periods-grid', 'return_periods', RETURN_PERIOD_OPTIONS, [10,25,50,100]);
+  buildChoiceGrid('wet-months-grid', 'wet_months', MONTH_OPTIONS, ['6','7','8','9']);
+  buildChoiceGrid('dry-months-grid', 'dry_months', MONTH_OPTIONS, ['12','1','2']);
+  addIntervalRow('2041-01-01','2060-12-31','Mid-century','2041-2060');
+  addIntervalRow('2081-01-01','2100-12-31','End-century','2081-2100');
+}
+window.addEventListener('load', initOptionsForm);
+
+function onShpSelected(file){
+  if(!file) return;
+  if(!file.name.toLowerCase().endsWith('.zip')){
+    alert('Please choose a .zip file containing the shapefile.');
+    return;
+  }
+  shpFile = file;
+  document.getElementById('shp-chip').innerHTML =
+    `<span class="file-chip">📦 ${file.name} (${(file.size/1024).toFixed(0)} KB)
+      <span class="remove" onclick="clearShp(event)">✕</span></span>`;
+}
+function clearShp(e){
+  e.stopPropagation();
+  shpFile = null;
+  document.getElementById('shp-input').value = '';
+  document.getElementById('shp-chip').innerHTML = '';
+}
+(function wireDropzone(){
+  window.addEventListener('load', () => {
+    const dz = document.getElementById('dropzone');
+    ['dragover','dragenter'].forEach(evt => dz.addEventListener(evt, e => { e.preventDefault(); dz.classList.add('drag'); }));
+    ['dragleave','drop'].forEach(evt => dz.addEventListener(evt, e => { e.preventDefault(); dz.classList.remove('drag'); }));
+    dz.addEventListener('drop', e => { if(e.dataTransfer.files[0]) onShpSelected(e.dataTransfer.files[0]); });
+  });
+})();
+
+function buildParamsObject(){
+  let advanced = {};
+  try{ advanced = JSON.parse(document.getElementById('advanced-json').value || '{}'); }
+  catch(e){ throw new Error('Advanced JSON overrides is invalid: ' + e.message); }
+
+  const geeProject = document.getElementById('gee-project').value.trim();
+  if(!geeProject) throw new Error('GEE project ID is required.');
+
+  let models = getCheckedValues('models');
+  const customModels = document.getElementById('models-custom').value.trim();
+  if(customModels) models = models.concat(customModels.split(',').map(s => s.trim()).filter(Boolean));
+  if(!models.length) throw new Error('Select at least one CMIP6 model.');
+
+  const scenarios = getCheckedValues('scenarios');
+  if(!scenarios.length) throw new Error('Select at least one scenario.');
+
+  const futureIntervals = buildFutureIntervals();
+  if(!futureIntervals.length) throw new Error('Add at least one future interval.');
+
+  let returnPeriods = getCheckedValues('return_periods').map(Number);
+  const customRP = document.getElementById('custom-return-periods').value.trim();
+  if(customRP) returnPeriods = returnPeriods.concat(customRP.split(',').map(s => Number(s.trim())).filter(n => !isNaN(n)));
+
+  const params = {
+    gee_project_id: geeProject,
+    buffer_km: Number(document.getElementById('buffer-km').value) || 25,
+    models,
+    scenarios,
+    baseline_start: document.getElementById('baseline-start').value.trim(),
+    baseline_end: document.getElementById('baseline-end').value.trim(),
+    future_intervals: futureIntervals,
+    wet_months: getCheckedValues('wet_months').map(Number),
+    dry_months: getCheckedValues('dry_months').map(Number),
+    return_periods: Array.from(new Set(returnPeriods)),
+    gev_n_bootstrap: Number(document.getElementById('n-bootstrap').value) || 1000,
+    nquantiles: Number(document.getElementById('n-quantiles').value) || 50,
+    wet_thresh: Number(document.getElementById('wet-thresh').value) || 0.1,
+    temp_thresholds: {},
+    precip_thresholds: {},
+  };
+  const histStart = document.getElementById('hist-start').value.trim();
+  if(histStart) params.hist_start = histStart;
+
+  return Object.assign(params, advanced);
+}
+
+function toggleSetup(){
+  const el = document.getElementById('setup-body');
+  const btn = document.getElementById('setup-toggle');
+  const open = el.style.display === 'block';
+  el.style.display = open ? 'none' : 'block';
+  btn.classList.toggle('open', !open);
+}
+
+function initGis(){
+  if(!window.google || !google.accounts){ setTimeout(initGis, 300); return; }
+  tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: CLIENT_ID,
+    scope: SCOPE,
+    callback: (resp) => {
+      if(resp.error){ alert('Sign-in failed: ' + resp.error); return; }
+      accessToken = resp.access_token;
+      document.getElementById('signed-in-panel').style.display = 'block';
+      document.getElementById('signin-btn').style.display = 'none';
+      document.getElementById('run-btn').disabled = false;
+      document.getElementById('num-1').classList.add('done');
+      document.getElementById('num-1').textContent = '✓';
+    }
+  });
+}
+window.addEventListener('load', initGis);
+
+function signIn(){
+  if(CLIENT_ID.startsWith("YOUR_CLIENT_ID")){
+    alert("Add your OAuth Client ID first — see the setup notes in step 1.");
+    return;
+  }
+  tokenClient.requestAccessToken();
+}
+
+async function driveFetch(url, opts={}){
+  opts.headers = Object.assign({}, opts.headers, {Authorization: `Bearer ${accessToken}`});
+  const r = await fetch(url, opts);
+  if(!r.ok) throw new Error(`Drive API error ${r.status}: ${await r.text()}`);
+  return r;
+}
+
+async function findOrCreateFolder(name, parentId=null){
+  let q = `name='${name.replace(/'/g,"\\'")}' and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+  if(parentId) q += ` and '${parentId}' in parents`;
+  const r = await driveFetch(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name)`);
+  const data = await r.json();
+  if(data.files && data.files.length) return data.files[0].id;
+  const meta = {name, mimeType:'application/vnd.google-apps.folder'};
+  if(parentId) meta.parents=[parentId];
+  const cr = await driveFetch('https://www.googleapis.com/drive/v3/files', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(meta)
+  });
+  return (await cr.json()).id;
+}
+
+// content can be a string (JSON/text files) or a File/Blob (binary, e.g. the shapefile zip)
+async function uploadFile(name, parentId, content, mimeType='application/json'){
+  const boundary = 'runner-boundary-' + Date.now();
+  const metadata = {name, parents:[parentId]};
+  const parts = [
+    `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n`,
+    `--${boundary}\r\nContent-Type: ${mimeType}\r\n\r\n`,
+    content,
+    `\r\n--${boundary}--`
+  ];
+  const body = new Blob(parts);
+  const r = await driveFetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+    method:'POST',
+    headers: {'Content-Type': `multipart/related; boundary=${boundary}`},
+    body
+  });
+  return r.json();
+}
+
+async function listChildren(parentId){
+  const q = `'${parentId}' in parents and trashed=false`;
+  const r = await driveFetch(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name)`);
+  return (await r.json()).files || [];
+}
+
+async function readFileText(fileId){
+  const r = await driveFetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`);
+  return r.text();
+}
+
+// ── Progress bar ─────────────────────────────────────────────────────────
+// The Colab side has no numeric progress signal, only a stdout log. We
+// rebuild an approximate progress bar by counting known stage markers
+// (main.py's print statements) against the counts we *expect* given the
+// job's own params — so it stays accurate whether 1 period was picked or 6.
+let expectedCounts = null;
+
+function computeExpectedCounts(paramsObj){
+  const nVars = 4; // tas, tasmax, tasmin, pr — fixed in main.py
+  const nModels = (paramsObj.models || []).length || 1;
+  const nScenarios = (paramsObj.scenarios || []).length || 1;
+  const nIntervals = (paramsObj.future_intervals || []).length || 1;
+  return {
+    bias: nVars * nModels * nScenarios * nIntervals,
+    ensemble: nVars * nScenarios * nIntervals,
+    scenarioTables: nScenarios,
+  };
+}
+
+// Ordered phases. Each has a weight (sums to 100) and a way to measure
+// how "done" it is from the log text so far.
+function buildStages(expected){
+  return [
+    { label:'Connecting to Earth Engine', weight:4,
+      done: log => /AOI prepared/.test(log) },
+    { label:'Bias-correcting CMIP6 models', weight:35,
+      frac: log => Math.min(1, (log.match(/saved → /g)||[]).length / Math.max(1, expected.bias)) },
+    { label:'Building ensemble means', weight:12,
+      frac: log => Math.min(1, (log.match(/Ensemble (mean|max) saved/g)||[]).length / Math.max(1, expected.ensemble*2)) },
+    { label:'Writing Excel summaries', weight:12,
+      done: log => /Template-style Excel report saved|Template-style Excel report failed/.test(log) },
+    { label:'Plotting fan charts', weight:8,
+      done: log => /fanchart_pr\.png|fan chart \(pr\)/.test(log) },
+    { label:'Rendering comparison charts', weight:8,
+      done: log => /scenario-comparison bar charts saved/.test(log) },
+    { label:'Rendering spatial maps', weight:15,
+      done: log => /Spatial maps saved|No spatial maps were generated/.test(log) },
+    { label:'Model agreement maps', weight:5,
+      done: log => /Model agreement\/sensitivity maps saved/.test(log) },
+    { label:'Finalizing', weight:1,
+      done: log => /PIPELINE COMPLETE/.test(log) },
+  ];
+}
+
+function updateProgress(logText, status){
+  const fillEl = document.getElementById('progress-fill');
+  const stageEl = document.getElementById('progress-stage');
+  const pctEl = document.getElementById('progress-pct');
+
+  if(status === 'error'){
+    fillEl.classList.add('error');
+    stageEl.textContent = 'Failed';
+    return;
+  }
+  fillEl.classList.remove('error');
+
+  if(!logText || status === 'idle' || status === 'queued'){
+    fillEl.style.width = '0%';
+    stageEl.textContent = status === 'queued' ? 'Queued — waiting for the Colab worker' : 'Not started';
+    pctEl.textContent = '0%';
+    return;
+  }
+
+  const stages = buildStages(expectedCounts || { bias:1, ensemble:1, scenarioTables:1 });
+  let pct = 0;
+  let currentLabel = stages[0].label;
+
+  for(const stage of stages){
+    const stageFrac = stage.done ? (stage.done(logText) ? 1 : 0) : stage.frac(logText);
+    pct += stage.weight * Math.max(0, Math.min(1, stageFrac));
+    if(stageFrac < 1 && currentLabel === stages[0].label) currentLabel = stage.label;
+    if(stageFrac < 1){ currentLabel = stage.label; break; }
+    currentLabel = 'Wrapping up';
+  }
+
+  if(/PIPELINE COMPLETE/.test(logText)){ pct = 100; currentLabel = 'Complete'; }
+
+  pct = Math.round(Math.max(0, Math.min(100, pct)));
+  fillEl.style.width = pct + '%';
+  pctEl.textContent = pct + '%';
+  stageEl.textContent = currentLabel;
+}
+
+function setPill(status){
+  const el = document.getElementById('status-pill');
+  el.className = 'pill ' + status;
+  el.innerHTML = `<span class="dot"></span> ${status}`;
+}
+
+async function startJob(){
+  try{
+    if(!shpFile){ alert('Upload a zipped shapefile first.'); return; }
+
+    let paramsObj;
+    try{ paramsObj = buildParamsObject(); }
+    catch(e){ alert(e.message); return; }
+
+    document.getElementById('run-btn').disabled = true;
+    setPill('queued');
+
+    const jobsFolderId = await findOrCreateFolder('climate-downscaling-jobs');
+    const jobName = 'job-' + new Date().toISOString().replace(/[:.]/g,'-');
+    const jobFolderId = await findOrCreateFolder(jobName, jobsFolderId);
+    currentJobFolderId = jobFolderId;
+
+    await uploadFile('aoi.zip', jobFolderId, shpFile, 'application/zip');
+    await uploadFile('request.json', jobFolderId, JSON.stringify(paramsObj, null, 2), 'application/json');
+
+    document.getElementById('job-name').textContent = jobName;
+    document.getElementById('log').textContent = '';
+    expectedCounts = computeExpectedCounts(paramsObj);
+    updateProgress('', 'queued');
+    setPill('queued');
+    pollJob();
+  }catch(err){
+    alert('Failed to submit job: ' + err.message);
+    document.getElementById('run-btn').disabled = false;
+  }
+}
+
+function pollJob(){
+  if(pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(async () => {
+    try{
+      const files = await listChildren(currentJobFolderId);
+      const statusFile = files.find(f => f.name === 'status.json');
+      const logFile = files.find(f => f.name === 'log.txt');
+
+      let statusStr = 'queued', logText = '';
+      if(statusFile){
+        const status = JSON.parse(await readFileText(statusFile.id));
+        statusStr = status.status || 'queued';
+        setPill(statusStr);
+        if(statusStr === 'done' || statusStr === 'error'){
+          clearInterval(pollTimer);
+          document.getElementById('run-btn').disabled = false;
+        }
+      }
+      if(logFile){
+        logText = await readFileText(logFile.id);
+        const logEl = document.getElementById('log');
+        logEl.textContent = logText;
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+      updateProgress(logText, statusStr === 'done' ? 'done' : statusStr);
+      if(statusStr === 'done'){
+        document.getElementById('progress-fill').style.width = '100%';
+        document.getElementById('progress-pct').textContent = '100%';
+        document.getElementById('progress-stage').textContent = 'Complete';
+      }
+    }catch(err){
+      console.error('Poll error', err);
+    }
+  }, 8000);
+}
+</script>
+</body>
+</html>

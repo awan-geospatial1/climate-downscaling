@@ -4,6 +4,7 @@ import pandas as pd
 import xarray as xr
 import geopandas as gpd
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 from matplotlib.patches import PathPatch
 from matplotlib.path import Path
 from scipy.ndimage import gaussian_filter
@@ -310,3 +311,164 @@ def make_spatial_map(index_da_2d, geom_native, out_path, title, cmap='viridis',
     fig.savefig(out_path, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close(fig)
     print(f"🗺️  Map saved: {out_path}")
+
+
+def _clip_to_aoi(cf, geom_native, ax):
+    """Shared clip logic — see the matplotlib >=3.8 note in make_spatial_map."""
+    clip_path = _polygon_to_mpl_path(geom_native)
+    patch = PathPatch(clip_path, transform=ax.transData)
+    artists = list(getattr(cf, 'collections', None) or [])
+    if hasattr(cf, 'set_clip_path'):
+        artists.append(cf)
+    for artist in artists:
+        try:
+            artist.set_clip_path(patch)
+        except Exception:
+            pass
+
+
+def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_order,
+                             geom_native, districts_gdf, out_path,
+                             var_title, unit_baseline, unit_delta,
+                             cmap_baseline='YlOrRd', diverging_cmap='RdBu_r',
+                             pct_change=False, smooth_sigma=1.0,
+                             add_satellite=True, tile_zoom=8):
+    """
+    AJK-report-style composite: one large baseline panel (own colorbar) plus
+    a grid of scenario x period change panels sharing one diverging colorbar.
+
+    Rows = scenario_order, columns = period_order — both are just lists, so
+    this auto-sizes to however many periods were selected (3, 4, 5, ...)
+    without any other change.
+
+    baseline_da    : xr.DataArray (lat, lon) — ensemble-mean baseline field.
+    scenario_grids : {scenario: {tag: xr.DataArray(lat, lon)}} — ensemble-mean
+                      future field for every scenario/period cell. A missing
+                      cell is simply left blank rather than erroring.
+    scenario_order : [scenario, ...] top-to-bottom row order.
+    period_order   : [(tag, label), ...] left-to-right column order; `label`
+                      is what's printed as the column header (e.g. '2021-2040').
+    districts_gdf  : original, non-dissolved AOI GeoDataFrame — draws each
+                      district/sub-basin's own boundary in white, like the
+                      reference figure. Pass None to only draw the outer edge.
+    pct_change     : True -> cells show % change vs baseline (precip-style);
+                      False -> cells show absolute change (temperature-style).
+    """
+    n_rows, n_cols = len(scenario_order), len(period_order)
+    proj = ccrs.PlateCarree()
+
+    shp_outer = gpd.GeoSeries([geom_native], crs='EPSG:4326')
+    minx, miny, maxx, maxy = shp_outer.total_bounds
+    buf = 0.25
+    extent = [minx - buf, maxx + buf, miny - buf, maxy + buf]
+
+    base_sorted = baseline_da.sortby('lat').sortby('lon')
+    base_smooth = _smooth_field(base_sorted.values, sigma=smooth_sigma)
+    lonb, latb = base_sorted['lon'].values, base_sorted['lat'].values
+
+    # First pass: compute every cell's delta field and pool them so the whole
+    # grid can share one symmetric, outlier-robust color range.
+    cell_fields, all_finite_vals = {}, []
+    for scenario in scenario_order:
+        for tag, _label in period_order:
+            da = scenario_grids.get(scenario, {}).get(tag)
+            if da is None:
+                continue
+            da_sorted = da.sortby('lat').sortby('lon')
+            vals_smooth = _smooth_field(da_sorted.values, sigma=smooth_sigma)
+            if pct_change:
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    delta = np.where(np.abs(base_smooth) > 1e-6,
+                                      (vals_smooth - base_smooth) / np.abs(base_smooth) * 100,
+                                      np.nan)
+            else:
+                delta = vals_smooth - base_smooth
+            cell_fields[(scenario, tag)] = (da_sorted['lon'].values, da_sorted['lat'].values, delta)
+            finite = delta[np.isfinite(delta)]
+            if finite.size:
+                all_finite_vals.append(finite)
+
+    if all_finite_vals:
+        vmax = float(np.nanpercentile(np.abs(np.concatenate(all_finite_vals)), 98)) or 1.0
+    else:
+        vmax = 1.0
+    vmin = -vmax
+
+    fig_h = 2.9 * n_rows + 1.4
+    title_band_in = 0.9  # fixed absolute height regardless of n_rows, so a 1-row
+                          # grid doesn't compress/overlap the two title lines
+    fig_h_total = fig_h + title_band_in
+    fig = plt.figure(figsize=(3.4 + 2.9 * n_cols, fig_h_total), facecolor='white')
+    top_frac = fig_h / fig_h_total
+    gs = fig.add_gridspec(n_rows, n_cols + 1, width_ratios=[1.5] + [1] * n_cols,
+                           wspace=0.05, hspace=0.15, top=top_frac, bottom=0.08)
+
+    change_word = '% change' if pct_change else 'change'
+    fig.suptitle(f'{var_title} — AJK', fontsize=13, fontweight='bold',
+                 y=1 - (0.32 / fig_h_total))
+    scenario_label = ' vs '.join(s.upper() for s in scenario_order)
+    fig.text(0.5, 1 - (0.65 / fig_h_total),
+              f'{scenario_label}  |  {change_word} relative to baseline',
+              ha='center', fontsize=10.5)
+
+    # ── Baseline panel (spans all rows, own colorbar) ──────────────────────
+    ax_base = fig.add_subplot(gs[:, 0], projection=proj)
+    ax_base.set_extent(extent, crs=proj)
+    _add_background(ax_base, add_satellite, tile_zoom)
+    cf_base = ax_base.contourf(lonb, latb, base_smooth, levels=60, cmap=cmap_baseline,
+                                transform=proj, extend='both', zorder=3)
+    _clip_to_aoi(cf_base, geom_native, ax_base)
+    shp_outer.boundary.plot(ax=ax_base, color='black', linewidth=1.2, transform=proj, zorder=6)
+    if districts_gdf is not None:
+        districts_gdf.boundary.plot(ax=ax_base, color='white', linewidth=0.8, transform=proj, zorder=6)
+    ax_base.set_title(f'Baseline\n{unit_baseline}', fontsize=9.5, fontweight='bold')
+    gl0 = ax_base.gridlines(draw_labels=True, linewidth=0.3, color='grey', alpha=0.4,
+                             linestyle='--', crs=proj)
+    gl0.top_labels = False; gl0.right_labels = False
+    gl0.xlocator = mticker.MaxNLocator(nbins=4)
+    gl0.xlabel_style = {'size': 8}
+    fig.colorbar(cf_base, ax=ax_base, location='left', shrink=0.85, pad=0.14, label=unit_baseline)
+
+    # ── Scenario x period grid (shared diverging colorbar) ─────────────────
+    grid_axes = []
+    cf_grid = None
+    for r, scenario in enumerate(scenario_order):
+        for c, (tag, label) in enumerate(period_order):
+            ax = fig.add_subplot(gs[r, c + 1], projection=proj)
+            ax.set_extent(extent, crs=proj)
+            grid_axes.append(ax)
+            cell = cell_fields.get((scenario, tag))
+            _add_background(ax, add_satellite, tile_zoom)
+            if cell is not None:
+                lon, lat, delta = cell
+                cf_grid = ax.contourf(lon, lat, delta, levels=60, cmap=diverging_cmap,
+                                       vmin=vmin, vmax=vmax, transform=proj, extend='both', zorder=3)
+                _clip_to_aoi(cf_grid, geom_native, ax)
+            shp_outer.boundary.plot(ax=ax, color='black', linewidth=0.8, transform=proj, zorder=6)
+            if districts_gdf is not None:
+                districts_gdf.boundary.plot(ax=ax, color='white', linewidth=0.6, transform=proj, zorder=6)
+            gl = ax.gridlines(draw_labels=(r == n_rows - 1), linewidth=0.25, color='grey',
+                               alpha=0.35, linestyle='--', crs=proj)
+            gl.top_labels = False; gl.right_labels = False
+            gl.xlocator = mticker.MaxNLocator(nbins=3)
+            gl.xlabel_style = {'size': 7}
+            if not (r == n_rows - 1):
+                gl.bottom_labels = False
+            gl.left_labels = False
+            if r == 0:
+                ax.set_title(label, fontsize=9.5, fontweight='bold')
+            if c == 0:
+                color = _scenario_color(scenario, scenario_order)
+                ax.annotate(scenario.upper(), xy=(-0.14, 0.5), xycoords='axes fraction',
+                            rotation=90, va='center', ha='center', fontsize=9,
+                            fontweight='bold', color='white',
+                            bbox=dict(boxstyle='round,pad=0.3', facecolor=color, edgecolor='none'))
+
+    if cf_grid is not None:
+        fig.colorbar(cf_grid, ax=grid_axes, location='right', shrink=0.85, pad=0.02,
+                      label=f'{var_title} {change_word}' + (f' ({unit_delta})' if unit_delta and not pct_change else ''))
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+    print(f"🗺️  Composite grid map saved ({n_rows}x{n_cols}): {out_path}")
