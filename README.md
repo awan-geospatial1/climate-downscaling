@@ -1,204 +1,175 @@
-# Climate Downscaling & Bias Correction
+# Climate Downscaling — Quantile Delta Mapping on Google Earth Engine
 
-An end-to-end pipeline that pulls CMIP6 climate projections and observational reference
-data from **Google Earth Engine**, bias-corrects the projections against the reference
-using **Quantile Delta Mapping (QDM)**, computes standard temperature/precipitation
-climate indices, and exports an Excel summary plus fan charts and spatial maps — all
-for a single area of interest (AOI) defined by a shapefile.
+Bias-correct and statistically downscale CMIP6 climate projections against a
+high-resolution observational reference (CHIRPS for precipitation, ERA5-Land
+for temperature), for any area of interest defined by a shapefile — all
+computed server-side on Google Earth Engine and post-processed locally with
+`xarray`/`xclim`.
 
-Runs interactively in Google Colab via `run_interactive.ipynb`, or programmatically via
-`main.run_pipeline(params)`.
+The pipeline trains a **Quantile Delta Mapping (QDM)** transfer function per
+model and variable, applies it to both the historical record and future
+scenario periods, derives standard climate indices, and exports tabular
+summaries, ensemble fan charts, and spatial maps — ready for a climate risk
+assessment or downscaling report.
 
 ## What it does
 
-1. **Reference data** — fetches daily precipitation (CHIRPS) and temperature
-   (ERA5-Land) for the baseline period over your AOI.
-2. **CMIP6 historical** — fetches matching historical GCM output (NASA/GDDP-CMIP6),
-   regrids it to the reference grid, and trains a QDM bias-correction model per
-   variable/model.
-3. **CMIP6 future** — fetches future SSP scenario data for each requested time
-   window, applies the trained QDM correction, and (for precipitation) adjusts wet-day
-   frequency to match the reference.
-4. **Indices** — computes annual/monthly temperature and precipitation indices
-   (means, threshold-exceedance days, wet/dry season totals, Rx1day, GEV return
-   levels, etc.) for the baseline and every scenario/period/model, then aggregates
-   across models (mean, p10, p90).
-5. **Outputs** — an Excel summary table, fan charts (historical + scenario spread
-   over time) for temperature and precipitation, and spatial maps of ensemble-mean
-   indices clipped to your AOI.
+1. **Load the area of interest** from a shapefile, buffer it, and build a
+   Google Earth Engine geometry (`main.load_shapefile`).
+2. **Fetch reference and CMIP6 data** for each variable over Earth Engine,
+   clipped to the AOI (`gee_utils.fetch_reference`, `gee_utils.fetch_cmip6`),
+   then regrid the model data onto the reference grid
+   (`gee_utils.regrid_to_reference`).
+3. **Train QDM** per variable/model on the baseline period and **apply it**
+   to the historical and future periods (`qdm_utils.train_qdm`,
+   `qdm_utils.apply_qdm`), with an optional wet-day frequency adjustment for
+   precipitation (`qdm_utils.adjust_wet_day_frequency`).
+4. **Compute climate indices** — temperature and precipitation — over the
+   baseline and every scenario/interval combination, then aggregate across
+   the model ensemble (`indices_utils.compute_temperature_indices`,
+   `compute_precipitation_indices`, `aggregate_across_models`). This
+   includes extreme value (GEV) return-level estimation with bootstrap
+   confidence bounds.
+5. **Export results**:
+   - Bias-corrected NetCDF grids per variable/model/scenario/interval
+   - An Excel summary (`climate_indices_summary.xlsx`) of every index with
+     mean/p10/p90 and a configurable "headline" statistic
+   - Ensemble fan charts for temperature and precipitation
+     (`plot_utils.plot_fan_chart`)
+   - Spatial maps of ensemble-mean indices (`plot_utils.make_spatial_map`)
 
-## Repository contents
+## Variables and reference datasets
 
-| File | Purpose |
-|---|---|
-| `config.py` | Per-variable settings: GEE source collection/band, units, QDM kind, clip ranges, wet-day adjustment flag, unit conversion factor. |
-| `gee_utils.py` | Fetches reference and CMIP6 data from Earth Engine via `xee`, chunked by 5-year windows; cleans/regrids to a common grid. |
-| `qdm_utils.py` | Trains/applies QDM bias correction (`xsdba`); adjusts precipitation wet-day frequency. |
-| `indices_utils.py` | Computes climate indices with `xclim`; GEV return-level bootstrapping for extreme precipitation. |
-| `plot_utils.py` | Fan charts and spatial maps (via `rioxarray`/`matplotlib`). |
-| `main.py` | Orchestrates the full pipeline (`run_pipeline`), builds the Excel summary. |
-| `run_interactive.ipynb` | Colab notebook with `ipywidgets` UI for shapefile upload and parameter entry. |
-| `requirements.txt` | Pinned dependencies. |
+| Variable | Description       | Reference collection            | Reference band          |
+|----------|--------------------|----------------------------------|--------------------------|
+| `tas`    | Mean temperature   | `ECMWF/ERA5_LAND/DAILY_AGGR`     | `temperature_2m`         |
+| `tasmax` | Max temperature    | `ECMWF/ERA5_LAND/DAILY_AGGR`     | `temperature_2m_max`     |
+| `tasmin` | Min temperature    | `ECMWF/ERA5_LAND/DAILY_AGGR`     | `temperature_2m_min`     |
+| `pr`     | Precipitation      | `UCSB-CHG/CHIRPS/DAILY`          | `precipitation`          |
 
-## Quick start (Google Colab)
+CMIP6 model data is pulled from Earth Engine's CMIP6 archive for whichever
+models and scenarios you specify. Per-variable settings (units, QDM kind —
+additive for temperature, multiplicative for precipitation — clipping
+bounds, fill values, and native scale) live in `config.py` and can be
+overridden.
 
-1. Open `run_interactive.ipynb` in Colab.
-2. Run the first cell — it mounts Drive, clones this repo, and installs
-   `requirements.txt`.
-3. Upload a shapefile (`.zip`, `.shp`, `.gpkg`, or `.geojson`) or point to one on
-   Drive, fill in the GCP project ID and parameters, and click **Run Pipeline**.
+## Repository layout
 
-Or manually, in any Colab cell:
+| File                   | Purpose                                                              |
+|-------------------------|-----------------------------------------------------------------------|
+| `main.py`               | Orchestrates the full pipeline (`run_pipeline`)                      |
+| `config.py`              | Per-variable settings and default QDM parameters                     |
+| `gee_utils.py`           | Earth Engine data fetching, regridding, and cleanup helpers          |
+| `qdm_utils.py`           | QDM training, application, and wet-day frequency adjustment          |
+| `indices_utils.py`       | Temperature/precipitation index calculation and ensemble aggregation |
+| `plot_utils.py`          | Fan chart and spatial map plotting                                   |
+| `run_interactive.ipynb`  | Interactive notebook front-end for running the pipeline              |
+| `requirements.txt`       | Python dependencies                                                  |
 
-```python
-!git clone https://github.com/awan-geospatial1/climate-downscaling.git
-%cd climate-downscaling
-!pip install -q -r requirements.txt --upgrade
+## Requirements
+
+- A Google Earth Engine account with a Cloud project enabled for Earth
+  Engine access
+- Python 3.9+ (packages: `earthengine-api`, `xarray`, `xclim`, `xee`,
+  `netCDF4`, `dask`, `geopandas`, `rioxarray`, `shapely`, `pyproj`, `scipy`,
+  `matplotlib`, `openpyxl`, `pandas`, `numpy`, `ipywidgets`, `xsdba`)
+
+Install everything with:
+
+```bash
+pip install -r requirements.txt
 ```
-**Restart the runtime after installing** (Colab preloads its own older versions of
-`xarray`/`shapely`/`pyproj`, and those can shadow the freshly installed ones until a
-restart).
 
-Then:
+## Setup
+
+1. **Authenticate with Earth Engine** (one-time, browser-based):
+
+   ```python
+   import ee
+   ee.Authenticate()
+   ```
+
+   `main.run_pipeline` will call `ee.Initialize()` automatically and fall
+   back to `ee.Authenticate()` + `ee.Initialize(project=...)` if needed.
+
+2. **Prepare a shapefile** of your area of interest (any CRS — it's
+   reprojected to EPSG:4326 automatically).
+
+## Usage
+
+Run the pipeline programmatically:
 
 ```python
 from main import run_pipeline
 
 params = {
-    'shapefile_path': '/content/aoi.shp',
-    'buffer_km': 25.0,
-    'gee_project_id': 'your-gcp-project-id',
-    'models': ['EC-Earth3', 'CNRM-CM6-1', 'GFDL-ESM4'],
-    'scenarios': ['ssp245', 'ssp585'],
-    'baseline_start': '1990-01-01',
-    'baseline_end': '2014-12-31',
-    'hist_start': '1990-01-01',
-    'future_intervals': [
-        ('2026-01-01', '2050-12-31', 'Short', '2026-2050'),
-        ('2051-01-01', '2075-12-31', 'Mid', '2051-2075'),
+    "shapefile_path": "aoi/my_area.shp",
+    "buffer_km": 25.0,                       # AOI buffer, default 25 km
+    "gee_project_id": "my-gee-project",
+    "models": ["ACCESS-CM2", "MIROC6"],      # CMIP6 model IDs
+    "scenarios": ["ssp245", "ssp585"],
+    "baseline_start": "1995-01-01",
+    "baseline_end": "2014-12-31",
+    "hist_start": "1985-01-01",              # optional, defaults to baseline_start
+    "future_intervals": [
+        ("2041-01-01", "2060-12-31", "Mid-century", "2041-2060"),
+        ("2081-01-01", "2100-12-31", "End-century", "2081-2100"),
     ],
-    'wet_months': [5, 6, 7, 8, 9, 10],
-    'dry_months': [1, 2, 3, 4, 11, 12],
-    'temp_thresholds': [30.0],
-    'precip_thresholds': [20.0, 25.0],
-    'return_periods': [100],
-    'gev_n_bootstrap': 1000,
-    'output_dir': '/content/drive/MyDrive/climate_output',
+    "wet_months": [6, 7, 8, 9],
+    "dry_months": [12, 1, 2],
+    "temp_thresholds": {...},
+    "precip_thresholds": {...},
+    "return_periods": [10, 25, 50, 100],
+    "gev_n_bootstrap": 1000,
+    "output_dir": "outputs/",
 }
+
 results = run_pipeline(params)
 ```
 
-You'll need a Google Earth Engine account with a registered Cloud project
-(`ee.Authenticate()` will prompt for this on first run).
+Or use the interactive notebook, `run_interactive.ipynb`, which wraps the
+same pipeline with widgets for picking the shapefile, models, scenarios,
+and date ranges.
 
-## Key parameters
+### Key parameters
 
-| Parameter | Meaning |
-|---|---|
-| `models` | CMIP6 GCM names, must match `model` values in `NASA/GDDP-CMIP6`. |
-| `scenarios` | SSP scenario codes, e.g. `ssp245`, `ssp370`, `ssp585`. |
-| `baseline_start` / `baseline_end` | Period used to train the QDM bias correction. |
-| `future_intervals` | List of `(start, end, label, tag)` tuples defining future windows. |
-| `wet_months` / `dry_months` | Month numbers (1–12) used for seasonal totals. |
-| `temp_thresholds` / `precip_thresholds` | °C / mm thresholds for exceedance-day counts. |
-| `return_periods` | Return periods (years) for GEV extreme-precipitation estimates. |
-| `nquantiles`, `qdm_group`, `wet_thresh` | QDM tuning knobs (default 50 quantiles, grouped by month, 0.1 mm wet-day threshold). |
+| Key                 | Description                                                        |
+|----------------------|----------------------------------------------------------------------|
+| `shapefile_path`     | Path to the AOI shapefile                                          |
+| `buffer_km`          | Buffer distance applied to the AOI before clipping                 |
+| `gee_project_id`     | Google Cloud project registered for Earth Engine                   |
+| `models`             | List of CMIP6 model IDs to downscale                                |
+| `scenarios`          | List of SSP scenarios (e.g. `ssp245`, `ssp585`)                     |
+| `baseline_start/end` | Historical calibration period used to train QDM                     |
+| `future_intervals`   | List of `(start, end, label, tag)` tuples for future periods         |
+| `nquantiles`         | Number of quantiles for QDM (default 50)                            |
+| `qdm_group`          | Grouping for QDM training, e.g. `time.month` (default)              |
+| `wet_thresh`         | Wet-day threshold (mm) for precipitation frequency adjustment        |
+| `return_periods`     | Return periods (years) for GEV extreme value analysis               |
+| `output_dir`         | Directory for all exported NetCDF, Excel, and plot outputs           |
 
 ## Outputs
 
-Written to `output_dir`, organized per variable rather than dumped in one folder:
+Running the pipeline populates `output_dir` with:
 
-```
-output_dir/
-├── climate_indices_summary.xlsx   # styled: colored header, unit column, domain/baseline shading
-├── fanchart_tas.png                # historical + scenario spread over time
-├── fanchart_pr.png
-├── tas/
-│   ├── ssp245/qdm_tas_<model>_ssp245_<tag>.nc      # per-model bias-corrected grids
-│   ├── ssp585/qdm_tas_<model>_ssp585_<tag>.nc
-│   └── ensemble/
-│       ├── tas_<scenario>_<tag>_ensemble_mean.nc   # ensemble-mean grid across models
-│       └── annual_mean_tas_panel.png               # Reference + scenario x period panel
-├── tasmax/  (same layout: ssp245/, ssp585/, ensemble/ -- includes txx_panel.png)
-├── tasmin/  (same layout: ssp245/, ssp585/, ensemble/ -- includes tnn_panel.png)
-└── pr/
-    ├── ssp245/  ssp585/            # per-model NetCDFs
-    └── ensemble/
-        ├── pr_<scenario>_<tag>_ensemble_mean.nc
-        └── prcptot_panel.png, rx5day_panel.png, sdii_panel.png, cwd_panel.png
-```
+- `qdm_<var>_<model>_<scenario>_<tag>.nc` — bias-corrected NetCDF grids
+- `climate_indices_summary.xlsx` — all temperature/precipitation indices
+  across baseline and future periods, with mean/p10/p90 and headline values
+- `fanchart_tas.png`, `fanchart_pr.png` — ensemble fan charts
+- `spatial_maps/*.png` — ensemble-mean spatial maps per index/scenario/period
 
-- **`{variable}/{scenario}/`** — the individual bias-corrected NetCDF for each GCM, so you
-  can inspect or reuse a single model's output without touching the rest.
-- **`{variable}/ensemble/`** — the model-ensemble mean NetCDF for each scenario/future
-  period, plus one **panel PNG per climate index**: a centered "Reference (baseline)"
-  tile on top, then one row per scenario × one column per future period below, all
-  smoothed, clipped to your AOI shapefile, and sharing a single colorbar with a
-  Mean/P99 stat box on every tile. Indices covered: `annual_mean_tas`, `txx`
-  (annual max temperature), `tnn` (annual min temperature) under `tas/`, `tasmax/`,
-  `tasmin/` respectively; `prcptot`, `rx5day`, `sdii`, `cwd` under `pr/`.
-- Top-level `climate_indices_summary.xlsx` (see below) and the two fan charts stay at
-  the root since they already summarize across variables/scenarios.
+## Method notes
 
-### Excel formatting
+- **QDM (Quantile Delta Mapping)** preserves the projected change signal
+  from each climate model while correcting its distributional bias against
+  the observational reference, applied additively for temperature and
+  multiplicatively for precipitation.
+- **Wet-day frequency adjustment** corrects the tendency of climate models
+  to simulate too many low-intensity "drizzle" days relative to observations.
+- **GEV return-level estimation** uses a bootstrap to quantify uncertainty
+  in extreme precipitation return periods.
 
-`climate_indices_summary.xlsx` (built by `report_utils.py`) is a formatted workbook, not
-a bare data dump:
-- Teal header row, frozen so it stays visible while scrolling, with an autofilter.
-- A title/subtitle banner naming the baseline period, models, and scenarios used.
-- An added **Unit** column (°C, mm, or days — inferred from the index/domain) so every
-  number is self-describing.
-- Row shading: gray for `Baseline` rows (no ensemble spread), light red for temperature
-  indices, light blue for precipitation indices — with a one-line legend above the table.
-- The `Headline Value` column is bolded, since that's the single representative
-  statistic (mean/p10/p90, per your `headline_stat` config) most people will scan first.
-- Temperature values are now stored and displayed in °C (previously raw Kelvin).
+## License
 
-This is purely a representation layer — every number is exactly what the pipeline
-computed; nothing here changes a formula or a result, only how it's shown.
-
-## Progress bars
-
-Every long-running stage (reference fetch, QDM training, future projections, ensemble
-means, index computation, spatial maps) shows a `tqdm` progress bar so you can see how
-much work remains instead of staring at silent gaps between print statements.
-
-## Notes on this version
-
-This copy has three fixes applied on top of the original code, all verified against
-current package versions:
-
-1. **`gee_utils.py`** — removed a broken `from xclim.sdba.base import convert_calendar`
-   import (that submodule no longer exists since `xclim` split its bias-adjustment code
-   into the separate `xsdba` package). Calendar conversion now uses xarray's own
-   `Dataset.convert_calendar()`.
-2. **`plot_utils.py`** — added a missing `import rioxarray`, without which the `.rio`
-   accessor used in `make_spatial_map()` doesn't exist and the spatial-maps step would
-   crash.
-3. **`qdm_utils.py`** — imports `xsdba` directly rather than through the deprecated
-   `xclim.sdba` shim.
-
-4. **`main.py`** — fixed a baseline-results bug: list-valued indices (e.g. per-month
-   arrays, threshold-day counts) were left as bare lists instead of being wrapped in
-   `{'mean','p10','p90'}` like every other index, which crashed the Excel-summary step
-   with `AttributeError: 'list' object has no attribute 'get'` as soon as any temperature
-   or precipitation threshold was configured. Fixed by wrapping consistently, while
-   still leaving `gev_return_levels` (a genuine nested dict) untouched.
-
-5. **`requirements.txt`** — the original `xsdba<0.4` pin caps `numpy<2.0`, but with
-   `pandas` left unpinned, pip installs the newest `pandas` (3.x), whose wheel needs
-   numpy's 2.x ABI even though its declared metadata bound (`numpy>=1.26`) doesn't
-   forbid numpy 1.x. Installing both together in the same environment silently produces
-   an ABI-incompatible combo and crashes with
-   `ValueError: numpy.dtype size changed, may indicate binary incompatibility` on the
-   very first `import pandas`. Fixed by widening the `xsdba` pin to `>=0.6,<1.0`, which
-   dropped the `numpy<2.0` cap — so numpy resolves to 2.x, matching what Colab's other
-   preinstalled packages (jax, opencv, etc.) already expect, instead of forcing a
-   downgrade that would destabilize them.
-
-`requirements.txt` pins `xclim`, `xsdba`, and `xee` to compatible ranges and adds
-`tqdm`; `run_interactive.ipynb` installs from `requirements.txt` (rather than a
-hardcoded package list) so it can't drift out of sync again. Every long-running loop
-now shows a `tqdm` progress bar, and output NetCDFs/plots are organized into
-per-variable/scenario/ensemble folders instead of one flat directory (see "Outputs"
-above).
+No license file is currently included in this repository. Add one (e.g. MIT,
+Apache-2.0) if you intend for others to reuse this code.
