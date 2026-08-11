@@ -168,8 +168,3 @@ Running the pipeline populates `output_dir` with:
   to simulate too many low-intensity "drizzle" days relative to observations.
 - **GEV return-level estimation** uses a bootstrap to quantify uncertainty
   in extreme precipitation return periods.
-
-## License
-
-No license file is currently included in this repository. Add one (e.g. MIT,
-Apache-2.0) if you intend for others to reuse this code.
