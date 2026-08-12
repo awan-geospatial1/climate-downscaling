@@ -829,6 +829,20 @@ async function startJob(){
   }
 }
 
+// FIX: the progress bar used to reset to 0% ("reduce percentage") whenever
+// a single poll's Drive files.list() call happened not to return
+// status.json/log.txt (eventually-consistent reads right after a write are
+// a known Drive API behaviour, not an error — the try/catch above it never
+// fires). The old code re-initialised statusStr='queued' and logText=''
+// EVERY poll and only filled them in if found THIS poll, so one missed
+// listing silently threw away everything already displayed and
+// updateProgress's `status === 'queued'` branch snapped the bar straight
+// back to 0%. Caching the last known-good values and only overwriting them
+// when a poll actually returns something makes a transient miss a no-op
+// instead of a visible regression.
+let lastStatusStr = 'queued';
+let lastLogText = '';
+
 function pollJob(){
   if(pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(async () => {
@@ -837,10 +851,11 @@ function pollJob(){
       const statusFile = files.find(f => f.name === 'status.json');
       const logFile = files.find(f => f.name === 'log.txt');
 
-      let statusStr = 'queued', logText = '';
+      let statusStr = lastStatusStr, logText = lastLogText;
       if(statusFile){
         const status = JSON.parse(await readFileText(statusFile.id));
-        statusStr = status.status || 'queued';
+        statusStr = status.status || lastStatusStr;
+        lastStatusStr = statusStr;
         setPill(statusStr);
         if(statusStr === 'done' || statusStr === 'error'){
           clearInterval(pollTimer);
@@ -849,6 +864,7 @@ function pollJob(){
       }
       if(logFile){
         logText = await readFileText(logFile.id);
+        lastLogText = logText;
         const logEl = document.getElementById('log');
         logEl.textContent = logText;
         logEl.scrollTop = logEl.scrollHeight;
