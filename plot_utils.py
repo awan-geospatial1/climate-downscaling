@@ -253,7 +253,16 @@ def make_spatial_map(index_da_2d, geom_native, out_path, title, cmap='viridis',
     index_da_2d : xr.DataArray with dims ('lat', 'lon')
     geom_native : shapely Polygon/MultiPolygon (unbuffered AOI, EPSG:4326)
     """
-    da = index_da_2d.sortby('lat').sortby('lon')
+    # FIX: sortby() does not guarantee axis ORDER, only sort direction along
+    # each named axis — the reducers upstream (e.g. xci.tg_mean(da).mean
+    # (dim='time')) can hand back a DataArray whose dims are ('lon', 'lat')
+    # instead of ('lat', 'lon'). .values then comes out transposed relative
+    # to what contourf(lon, lat, z) requires (z must be (len(lat), len(lon))),
+    # which is exactly what caused every single spatial/agreement map in a
+    # real run to fail with "Length of x (N) must match number of columns
+    # in z (M)". An explicit .transpose() makes the axis order unconditional
+    # regardless of what the reducer returned.
+    da = index_da_2d.sortby('lat').sortby('lon').transpose('lat', 'lon')
     lon = da['lon'].values
     lat = da['lat'].values
     vals_smooth = _smooth_field(da.values, sigma=smooth_sigma)
@@ -362,7 +371,9 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
     buf = 0.25
     extent = [minx - buf, maxx + buf, miny - buf, maxy + buf]
 
-    base_sorted = baseline_da.sortby('lat').sortby('lon')
+    # FIX: force ('lat','lon') axis order explicitly — see make_spatial_map's
+    # comment above for why sortby() alone isn't enough.
+    base_sorted = baseline_da.sortby('lat').sortby('lon').transpose('lat', 'lon')
     base_smooth = _smooth_field(base_sorted.values, sigma=smooth_sigma)
     lonb, latb = base_sorted['lon'].values, base_sorted['lat'].values
 
@@ -374,7 +385,7 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
             da = scenario_grids.get(scenario, {}).get(tag)
             if da is None:
                 continue
-            da_sorted = da.sortby('lat').sortby('lon')
+            da_sorted = da.sortby('lat').sortby('lon').transpose('lat', 'lon')
             vals_smooth = _smooth_field(da_sorted.values, sigma=smooth_sigma)
             if pct_change:
                 with np.errstate(divide='ignore', invalid='ignore'):
@@ -525,7 +536,7 @@ def make_composite_agreement_grid(agreement_grids, scenario_order, period_order,
             da = agreement_grids.get(scenario, {}).get(tag)
             _add_background(ax, add_satellite, tile_zoom)
             if da is not None:
-                da_sorted = da.sortby('lat').sortby('lon')
+                da_sorted = da.sortby('lat').sortby('lon').transpose('lat', 'lon')
                 vals = _smooth_field(da_sorted.values, sigma=1.0)
                 cf_grid = ax.contourf(da_sorted['lon'].values, da_sorted['lat'].values, vals,
                                        levels=60, cmap='RdYlGn', vmin=vmin, vmax=vmax,
