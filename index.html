@@ -696,7 +696,12 @@ function computeExpectedCounts(paramsObj){
   const nIntervals = (paramsObj.future_intervals || []).length || 1;
   return {
     bias: nVars * nModels * nScenarios * nIntervals,
-    ensemble: nVars * nScenarios * nIntervals,
+    // Ensemble MEAN is saved for all 4 variables, but ensemble MAX is only
+    // ever computed for pr (see main.py) — counting it for all 4 vars is
+    // what caused this stage to permanently cap around 50%, which then
+    // froze the whole bar (see the loop fix in updateProgress below too).
+    ensembleMean: nVars * nScenarios * nIntervals,
+    ensembleMax: 1 * nScenarios * nIntervals,
     scenarioTables: nScenarios,
   };
 }
@@ -707,19 +712,35 @@ function buildStages(expected){
   return [
     { label:'Connecting to Earth Engine', weight:4,
       done: log => /AOI prepared/.test(log) },
-    { label:'Bias-correcting CMIP6 models', weight:35,
+    { label:'Bias-correcting CMIP6 models', weight:28,
       frac: log => Math.min(1, (log.match(/saved → /g)||[]).length / Math.max(1, expected.bias)) },
-    { label:'Building ensemble means', weight:12,
-      frac: log => Math.min(1, (log.match(/Ensemble (mean|max) saved/g)||[]).length / Math.max(1, expected.ensemble*2)) },
-    { label:'Writing Excel summaries', weight:12,
+    { label:'Building ensemble means', weight:10,
+      frac: log => {
+        const mean = (log.match(/Ensemble mean saved/g)||[]).length;
+        const max = (log.match(/Ensemble max saved/g)||[]).length;
+        const denom = Math.max(1, expected.ensembleMean + expected.ensembleMax);
+        return Math.min(1, (mean + max) / denom);
+      } },
+    { label:'Computing indices (GEV return-period bootstrap)', weight:14,
+      frac: log => {
+        // This step used to run silently for minutes at a time (1000-iteration
+        // GEV bootstrap x every model/scenario/period, nothing printed in
+        // between) which looked like a stall even though Colab was busy the
+        // whole time. Heartbeat prints from main.py give real progress here.
+        const done = (log.match(/✅ .+ indices done \(\d+\/\d+\)/g)||[]).length;
+        const denom = Math.max(1, expected.ensembleMean); // one heartbeat per model/scenario/period, same shape as ensembleMean's count
+        if (/All scenario\/period indices computed/.test(log)) return 1;
+        return Math.min(0.98, done / denom);
+      } },
+    { label:'Writing Excel summaries', weight:10,
       done: log => /Template-style Excel report saved|Template-style Excel report failed/.test(log) },
     { label:'Plotting fan charts', weight:8,
-      done: log => /fanchart_pr\.png|fan chart \(pr\)/.test(log) },
+      done: log => /[✅❌] fanchart_pr\.png (exists|was NOT created)/.test(log) },
     { label:'Rendering comparison charts', weight:8,
       done: log => /scenario-comparison bar charts saved/.test(log) },
-    { label:'Rendering spatial maps', weight:15,
+    { label:'Rendering spatial maps', weight:9,
       done: log => /Spatial maps saved|No spatial maps were generated/.test(log) },
-    { label:'Model agreement maps', weight:5,
+    { label:'Model agreement maps', weight:8,
       done: log => /Model agreement\/sensitivity maps saved/.test(log) },
     { label:'Finalizing', weight:1,
       done: log => /PIPELINE COMPLETE/.test(log) },
@@ -745,17 +766,23 @@ function updateProgress(logText, status){
     return;
   }
 
-  const stages = buildStages(expectedCounts || { bias:1, ensemble:1, scenarioTables:1 });
+  const stages = buildStages(expectedCounts || { bias:1, ensembleMean:1, ensembleMax:1, scenarioTables:1 });
   let pct = 0;
-  let currentLabel = stages[0].label;
+  let currentLabel = null;
 
+  // IMPORTANT: every stage is scored independently and summed — we do NOT
+  // stop at the first stage that isn't fully "done". A single stage whose
+  // frac() estimate slightly undercounts (e.g. a printed-line count that's
+  // a little off) used to freeze the ENTIRE bar, because later stages'
+  // very real progress (Excel/charts/maps genuinely finishing) never got
+  // counted once the loop broke. Summing independently means one
+  // imperfect stage estimate can't hide real progress happening after it.
   for(const stage of stages){
-    const stageFrac = stage.done ? (stage.done(logText) ? 1 : 0) : stage.frac(logText);
-    pct += stage.weight * Math.max(0, Math.min(1, stageFrac));
-    if(stageFrac < 1 && currentLabel === stages[0].label) currentLabel = stage.label;
-    if(stageFrac < 1){ currentLabel = stage.label; break; }
-    currentLabel = 'Wrapping up';
+    const stageFrac = Math.max(0, Math.min(1, stage.done ? (stage.done(logText) ? 1 : 0) : stage.frac(logText)));
+    pct += stage.weight * stageFrac;
+    if(stageFrac < 1 && currentLabel === null) currentLabel = stage.label;
   }
+  if(currentLabel === null) currentLabel = 'Wrapping up';
 
   if(/PIPELINE COMPLETE/.test(logText)){ pct = 100; currentLabel = 'Complete'; }
 

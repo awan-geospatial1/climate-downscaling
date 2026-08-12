@@ -472,3 +472,91 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
     fig.savefig(out_path, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close(fig)
     print(f"🗺️  Composite grid map saved ({n_rows}x{n_cols}): {out_path}")
+
+
+def make_composite_agreement_grid(agreement_grids, scenario_order, period_order,
+                                   geom_native, districts_gdf, out_path,
+                                   var_title, add_satellite=True, tile_zoom=8,
+                                   vmin=20, vmax=100):
+    """
+    AJK-report-style model-agreement composite: NO baseline panel (unlike
+    make_composite_grid_map) — just a scenario x period grid of "% of
+    models agreeing on direction of change" panels sharing one colorbar,
+    matching the reference pr_model_agreement.png layout.
+
+    Rows = scenario_order, columns = period_order — both plain lists, so
+    this auto-sizes to however many scenarios (3, 4, ...) and periods
+    (3, 4, 5, ...) were actually selected, same as make_composite_grid_map.
+
+    agreement_grids : {scenario: {tag: xr.DataArray(lat, lon) or None}} —
+                        % agreement fields, e.g. from
+                        agreement_utils.compute_agreement_array. A missing
+                        /None cell is left blank rather than erroring.
+    vmin/vmax       : fixed color range (default 20-100, matching the
+                        reference figure) rather than data-driven, since
+                        "% agreement" has a meaningful fixed scale.
+    """
+    n_rows, n_cols = len(scenario_order), len(period_order)
+    proj = ccrs.PlateCarree()
+
+    shp_outer = gpd.GeoSeries([geom_native], crs='EPSG:4326')
+    minx, miny, maxx, maxy = shp_outer.total_bounds
+    buf = 0.25
+    extent = [minx - buf, maxx + buf, miny - buf, maxy + buf]
+
+    fig_h = 2.9 * n_rows + 1.4
+    title_band_in = 0.9
+    fig_h_total = fig_h + title_band_in
+    fig = plt.figure(figsize=(1.0 + 2.9 * n_cols, fig_h_total), facecolor='white')
+    top_frac = fig_h / fig_h_total
+    gs = fig.add_gridspec(n_rows, n_cols, wspace=0.05, hspace=0.15, top=top_frac, bottom=0.08)
+
+    fig.suptitle(f'{var_title} — Model Agreement — AJK', fontsize=13, fontweight='bold',
+                 y=1 - (0.32 / fig_h_total))
+    scenario_label = '  vs  '.join(s.upper() for s in scenario_order)
+    fig.text(0.5, 1 - (0.65 / fig_h_total), scenario_label, ha='center', fontsize=10.5)
+
+    grid_axes, cf_grid = [], None
+    for r, scenario in enumerate(scenario_order):
+        for c, (tag, label) in enumerate(period_order):
+            ax = fig.add_subplot(gs[r, c], projection=proj)
+            ax.set_extent(extent, crs=proj)
+            grid_axes.append(ax)
+            da = agreement_grids.get(scenario, {}).get(tag)
+            _add_background(ax, add_satellite, tile_zoom)
+            if da is not None:
+                da_sorted = da.sortby('lat').sortby('lon')
+                vals = _smooth_field(da_sorted.values, sigma=1.0)
+                cf_grid = ax.contourf(da_sorted['lon'].values, da_sorted['lat'].values, vals,
+                                       levels=60, cmap='RdYlGn', vmin=vmin, vmax=vmax,
+                                       transform=proj, extend='both', zorder=3)
+                _clip_to_aoi(cf_grid, geom_native, ax)
+            shp_outer.boundary.plot(ax=ax, color='black', linewidth=0.8, transform=proj, zorder=6)
+            if districts_gdf is not None:
+                districts_gdf.boundary.plot(ax=ax, color='white', linewidth=0.6, transform=proj, zorder=6)
+            gl = ax.gridlines(draw_labels=(r == n_rows - 1), linewidth=0.25, color='grey',
+                               alpha=0.35, linestyle='--', crs=proj)
+            gl.top_labels = False; gl.right_labels = False
+            gl.xlocator = mticker.MaxNLocator(nbins=3)
+            gl.xlabel_style = {'size': 7}
+            if not (r == n_rows - 1):
+                gl.bottom_labels = False
+            gl.left_labels = (c == 0)
+            gl.ylabel_style = {'size': 7}
+            if r == 0:
+                ax.set_title(label, fontsize=9.5, fontweight='bold')
+            if c == 0:
+                color = _scenario_color(scenario, scenario_order)
+                ax.annotate(scenario.upper(), xy=(-0.22, 0.5), xycoords='axes fraction',
+                            rotation=90, va='center', ha='center', fontsize=9,
+                            fontweight='bold', color='white',
+                            bbox=dict(boxstyle='round,pad=0.3', facecolor=color, edgecolor='none'))
+
+    if cf_grid is not None:
+        fig.colorbar(cf_grid, ax=grid_axes, location='right', shrink=0.85, pad=0.02,
+                      label='% of models agreeing on direction')
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+    print(f"🗺️  Composite agreement grid map saved ({n_rows}x{n_cols}): {out_path}")

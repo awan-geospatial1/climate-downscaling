@@ -12,7 +12,31 @@ scenario periods, derives standard climate indices, and exports tabular
 summaries, ensemble fan charts, and spatial maps — ready for a climate risk
 assessment or downscaling report.
 
+## Running the web app (recommended)
+
+The easiest way to run a job is `index.html` — a browser front end with a
+live progress bar and log — paired with `colab_runner.ipynb`, which does
+the actual compute in a Colab Pro runtime. `index.html` writes jobs to a
+Google Drive folder that `colab_runner.ipynb` polls; results and logs
+stream back the same way.
+
+1. Open `colab_runner.ipynb` in Colab, run every cell, and leave the tab
+   open — it polls for queued jobs every 10s.
+2. From this folder, start a local server:
+
+   ```
+   py -m http.server 8000
+   ```
+
+   (use `python3 -m http.server 8000` on macOS/Linux)
+3. Open **http://localhost:8000/index.html** in your browser — opening the
+   file directly (`file://...`) won't work with Google sign-in.
+4. Connect Google Drive, upload your AOI shapefile (as a `.zip`), fill in
+   the job parameters, and submit. Progress and logs stream back into the
+   page as `colab_runner.ipynb` works through the job.
+
 ## What it does
+
 
 1. **Load the area of interest** from a shapefile, buffer it, and build a
    Google Earth Engine geometry (`main.load_shapefile`).
@@ -62,7 +86,13 @@ overridden.
 | `gee_utils.py`           | Earth Engine data fetching, regridding, and cleanup helpers          |
 | `qdm_utils.py`           | QDM training, application, and wet-day frequency adjustment          |
 | `indices_utils.py`       | Temperature/precipitation index calculation and ensemble aggregation |
-| `plot_utils.py`          | Fan chart and spatial map plotting                                   |
+| `ensemble_utils.py`      | Ensemble mean/max computation and NetCDF export                      |
+| `agreement_utils.py`     | Model agreement (% agreeing on direction) and spread/SNR sensitivity |
+| `plot_utils.py`          | Fan charts, spatial maps, and AJK-style composite grid maps          |
+| `template_excel_utils.py`| Template-style Excel report (`template_style_report.xlsx`)           |
+| `index.html`             | Browser front end — submits jobs, streams progress/log               |
+| `colab_runner.ipynb`     | Colab worker — polls Drive for jobs submitted from `index.html`      |
+| `run_scheduled.ipynb`    | Non-interactive run on a fixed schedule/config (Colab Pro)            |
 | `run_interactive.ipynb`  | Interactive notebook front-end for running the pipeline              |
 | `requirements.txt`       | Python dependencies                                                  |
 
@@ -155,8 +185,22 @@ Running the pipeline populates `output_dir` with:
 - `qdm_<var>_<model>_<scenario>_<tag>.nc` — bias-corrected NetCDF grids
 - `climate_indices_summary.xlsx` — all temperature/precipitation indices
   across baseline and future periods, with mean/p10/p90 and headline values
+- `template_style_report.xlsx` — formatted report workbook, including a
+  precipitation-days-per-month block **for every configured threshold**
+  (not just one), max-precip and return-period sheets, and daily
+  spatial-average sheets
 - `fanchart_tas.png`, `fanchart_pr.png` — ensemble fan charts
 - `spatial_maps/*.png` — ensemble-mean spatial maps per index/scenario/period
+- `composite_<index>.png` — AJK-style composite grid (baseline panel +
+  scenario x period grid on one shared colorbar) for temperature,
+  precipitation, and extremes (`annual_mean_tas`, `annual_mean_tasmax`,
+  `annual_mean_tasmin`, `prcptot`, `rx1day`) — auto-sizes to however many
+  scenarios/periods were run
+- `composite_tas_model_agreement.png`, `composite_pr_model_agreement.png`
+  — % of models agreeing on direction of change, scenario x period grid
+- `<var>_model_agreement_*.png`, `<var>_sensitivity_spread_*.png`,
+  `<var>_sensitivity_snr_*.png` — individual per-cell agreement/spread/SNR
+  maps
 
 ## Method notes
 

@@ -268,59 +268,65 @@ def _pick_threshold_key(precip_thresholds, target=20.0):
 def _sheet_precipitation_stats(wb, results, scenarios, future_intervals, precip_thresholds):
     ws = wb.create_sheet('Precipitation Stats and Graph')
     periods = _period_labels(future_intervals)
-    thr, key = _pick_threshold_key(precip_thresholds)
-    if key is None:
+    if not precip_thresholds:
         ws.cell(row=1, column=1, value='No precip_thresholds configured - nothing to report here.')
         return
 
-    ws.cell(row=1, column=1, value=f'Days/month > {thr:g}mm')
-    ws.cell(row=1, column=2, value='Baseline')
-    col = 3
-    for scenario in scenarios:
-        start_col = col
-        for _, label in periods:
-            ws.cell(row=2, column=col, value=label)
-            col += 1
-        ws.merge_cells(start_row=1, start_column=start_col, end_row=1, end_column=col - 1)
-        ws.cell(row=1, column=start_col, value=scenario.upper())
-    total_cols = col - 1
-    _style_header_row(ws, 1, 1, total_cols)
-    _style_header_row(ws, 2, 2, total_cols)
-
-    base_stat = results.get('Baseline', {}).get('precipitation', {}).get(key, {})
-    # NOTE: as of the main.py fix, Baseline list-valued indices are wrapped
-    # the same {'mean','p10','p90'} way as every scenario/period (previously
-    # they were a raw list -- see the fix comment in main.py's results['Baseline']
-    # construction for why that was a bug worth fixing, not a style choice).
-    base_vals = base_stat.get('mean') if isinstance(base_stat, dict) else base_stat
-    chart_start_row = 3
-    for m in range(12):
-        row = chart_start_row + m
-        ws.cell(row=row, column=1, value=MONTH_NAMES[m])
-        bv = base_vals[m] if isinstance(base_vals, list) else None
-        ws.cell(row=row, column=2, value=round(bv, 2) if bv is not None else None)
+    # Every configured threshold gets its own stacked block below, not just
+    # whichever one happens to be closest to 20mm — the ensemble stats for
+    # every threshold are already computed by aggregate_across_models, this
+    # sheet was just silently dropping all but one of them.
+    row_cursor = 1
+    for thr in precip_thresholds:
+        key = f'wetdays_per_month_{thr:g}mm'
+        ws.cell(row=row_cursor, column=1, value=f'Days/month > {thr:g}mm')
+        ws.cell(row=row_cursor, column=2, value='Baseline')
         col = 3
+        header_row = row_cursor
+        subheader_row = row_cursor + 1
         for scenario in scenarios:
-            for tag, _ in periods:
-                stat = results.get(f'{scenario}_{tag}', {}).get('precipitation', {}).get(key, {})
-                vals = stat.get('mean') if isinstance(stat, dict) else None
-                v = vals[m] if isinstance(vals, list) else None
-                ws.cell(row=row, column=col, value=round(v, 2) if v is not None else None)
+            start_col = col
+            for _, label in periods:
+                ws.cell(row=subheader_row, column=col, value=label)
                 col += 1
+            ws.merge_cells(start_row=header_row, start_column=start_col, end_row=header_row, end_column=col - 1)
+            ws.cell(row=header_row, column=start_col, value=scenario.upper())
+        total_cols = col - 1
+        _style_header_row(ws, header_row, 1, total_cols)
+        _style_header_row(ws, subheader_row, 2, total_cols)
+
+        base_stat = results.get('Baseline', {}).get('precipitation', {}).get(key, {})
+        base_vals = base_stat.get('mean') if isinstance(base_stat, dict) else base_stat
+        chart_start_row = subheader_row + 1
+        for m in range(12):
+            row = chart_start_row + m
+            ws.cell(row=row, column=1, value=MONTH_NAMES[m])
+            bv = base_vals[m] if isinstance(base_vals, list) else None
+            ws.cell(row=row, column=2, value=round(bv, 2) if bv is not None else None)
+            col = 3
+            for scenario in scenarios:
+                for tag, _ in periods:
+                    stat = results.get(f'{scenario}_{tag}', {}).get('precipitation', {}).get(key, {})
+                    vals = stat.get('mean') if isinstance(stat, dict) else None
+                    v = vals[m] if isinstance(vals, list) else None
+                    ws.cell(row=row, column=col, value=round(v, 2) if v is not None else None)
+                    col += 1
+
+        try:
+            chart = LineChart()
+            chart.title = f'Days/month with precip > {thr:g}mm'
+            chart.y_axis.title = 'days'
+            data = Reference(ws, min_col=2, max_col=total_cols, min_row=subheader_row, max_row=chart_start_row + 11)
+            cats = Reference(ws, min_col=1, max_col=1, min_row=chart_start_row, max_row=chart_start_row + 11)
+            chart.add_data(data, titles_from_data=True)
+            chart.set_categories(cats)
+            ws.add_chart(chart, f'{get_column_letter(total_cols + 2)}{header_row}')
+        except Exception as e:
+            print(f"    [template-excel] precipitation chart ({thr:g}mm) failed: {e}")
+
+        row_cursor = chart_start_row + 12 + 3  # blank rows before next threshold's block
 
     ws.column_dimensions['A'].width = 16
-
-    try:
-        chart = LineChart()
-        chart.title = f'Days/month with precip > {thr:g}mm'
-        chart.y_axis.title = 'days'
-        data = Reference(ws, min_col=2, max_col=total_cols, min_row=2, max_row=chart_start_row + 11)
-        cats = Reference(ws, min_col=1, max_col=1, min_row=chart_start_row, max_row=chart_start_row + 11)
-        chart.add_data(data, titles_from_data=True)
-        chart.set_categories(cats)
-        ws.add_chart(chart, f'{get_column_letter(total_cols + 2)}2')
-    except Exception as e:
-        print(f"    [template-excel] precipitation chart failed: {e}")
 
 
 # =========================================================================

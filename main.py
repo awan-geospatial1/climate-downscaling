@@ -6,7 +6,7 @@ from gee_utils import fetch_reference, fetch_cmip6, regrid_to_reference, clean_t
 from qdm_utils import train_qdm, apply_qdm, adjust_wet_day_frequency
 from indices_utils import (compute_temperature_indices, compute_precipitation_indices, aggregate_across_models,
                            daily_spatial_series, daily_spatial_ensemble)
-from plot_utils import plot_fan_chart, make_spatial_map, plot_index_comparison
+from plot_utils import plot_fan_chart, make_spatial_map, plot_index_comparison, make_composite_grid_map, make_composite_agreement_grid
 from ensemble_utils import compute_ensemble_mean, compute_ensemble_max, save_ensemble_netcdf
 from agreement_utils import make_agreement_sensitivity_maps
 from template_excel_utils import write_template_style_excel
@@ -29,7 +29,12 @@ def load_shapefile(shp_path, buffer_km):
                       else gpd.GeoSeries(buffered_utm, crs=utm_crs).to_crs(epsg=4326).unary_union)
     minx, miny, maxx, maxy = geom_buffered.bounds
     extent = [minx, miny, maxx, maxy]
-    return geom_native, geom_buffered, extent
+    # `gdf` (pre-dissolve) is returned too so composite grid maps can draw
+    # each district/sub-basin's own boundary, not just the outer AOI edge —
+    # union_all() above is what a single-polygon caller (AOI clip/buffer)
+    # needs, but it throws away exactly the internal boundaries the
+    # AJK-style composite maps want.
+    return geom_native, geom_buffered, extent, gdf
 
 
 def run_pipeline(params):
@@ -90,7 +95,7 @@ def run_pipeline(params):
             ee.Initialize(project=gee_project_id)
             print(f"✅ GEE initialised with project: {gee_project_id}")
 
-    geom_native, geom_buffered, extent = load_shapefile(shp_path, buffer_km)
+    geom_native, geom_buffered, extent, districts_gdf = load_shapefile(shp_path, buffer_km)
     region = ee.Geometry(mapping(geom_buffered))
     print("✅ AOI prepared.")
 
@@ -221,11 +226,13 @@ def run_pipeline(params):
                           f"skipping ensemble mean/max (nothing to aggregate).")
 
     results = {}
+    print("\n📈 Computing baseline indices (incl. GEV return-period bootstrap)...")
     temp_baseline = compute_temperature_indices(ref_cache['tas']['ref'], ref_cache['tasmax']['ref'],
                                                  ref_cache['tasmin']['ref'], b_start, b_end, temp_thresholds)
     precip_baseline = compute_precipitation_indices(ref_cache['pr']['ref'], b_start, b_end,
                                                       precip_thresholds, wet_months, dry_months,
                                                       return_periods, n_boot)
+    print("✅ Baseline indices computed.")
 
     # FIX (pre-existing bug, not introduced by anything above): this used to
     # wrap SCALAR baseline values into {'mean','p10','p90'} but leave
@@ -250,6 +257,8 @@ def run_pipeline(params):
     for scenario in scenarios:
         for start, end, label, tag in future_intervals:
             key = f'{scenario}_{tag}'
+            print(f"📈 Computing indices for {scenario}/{tag} (incl. GEV return-period bootstrap, "
+                  f"{n_boot} iterations/model)...")
             temp_list, precip_list = [], []
             for model in models:
                 if (model not in corrected_grids['tas'][scenario][tag] or
@@ -264,10 +273,12 @@ def run_pipeline(params):
                 temp_list.append(compute_temperature_indices(tas, tasmax, tasmin, start, end, temp_thresholds))
                 precip_list.append(compute_precipitation_indices(pr, start, end, precip_thresholds,
                                                                    wet_months, dry_months, return_periods, n_boot))
+                print(f"   ✅ {model} indices done ({len(temp_list)}/{len(models)})")
             results[key] = {
                 'temperature': aggregate_across_models(temp_list, return_periods),
                 'precipitation': aggregate_across_models(precip_list, return_periods)
             }
+    print("✅ All scenario/period indices computed.\n")
 
     rows = []
     for period, groups in results.items():
@@ -415,6 +426,12 @@ def run_pipeline(params):
     index_map = {
         'annual_mean_tas': ('tas', lambda da: xci.tg_mean(da, freq='YS').mean(dim='time')),
         'prcptot': ('pr', lambda da: xci.precip_accumulation(da, freq='YS').mean(dim='time')),
+        # Extremes — same reducer pattern (per-gridcell annual climatology),
+        # just different xclim functions. tasmax/tasmin capture hot/cold
+        # extremes, rx1day captures the wettest single day per year.
+        'annual_mean_tasmax': ('tasmax', lambda da: xci.tx_mean(da, freq='YS').mean(dim='time')),
+        'annual_mean_tasmin': ('tasmin', lambda da: xci.tn_mean(da, freq='YS').mean(dim='time')),
+        'rx1day': ('pr', lambda da: xci.max_1day_precipitation_amount(da, freq='YS').mean(dim='time')),
     }
 
     maps_made = 0
@@ -446,15 +463,70 @@ def run_pipeline(params):
     for reason in maps_skipped:
         print(f"   ⚠️ skipped: {reason}")
 
+    # ── Composite AJK-style grid maps (temperature, precipitation, extremes) ─
+    # Baseline panel + a scenario x period grid sharing one colorbar, per
+    # index. scenario_order/period_order come straight from this run's own
+    # params, so the grid auto-sizes to however many scenarios (3, 4, ...)
+    # and periods (3, 4, 5, ...) were actually selected — no code change
+    # needed for a bigger run.
+    period_order = [(tag, label) for (start, end, label, tag) in future_intervals]
+    composite_cfg = {
+        'annual_mean_tas': dict(pct_change=False, cmap_baseline='YlOrRd',
+                                 var_title='Mean Temperature', unit_baseline='°C', unit_delta='°C'),
+        'annual_mean_tasmax': dict(pct_change=False, cmap_baseline='YlOrRd',
+                                    var_title='Mean Max Temperature', unit_baseline='°C', unit_delta='°C'),
+        'annual_mean_tasmin': dict(pct_change=False, cmap_baseline='YlOrRd',
+                                    var_title='Mean Min Temperature', unit_baseline='°C', unit_delta='°C'),
+        'prcptot': dict(pct_change=True, cmap_baseline='YlGnBu',
+                         var_title='Precipitation', unit_baseline='mm/year', unit_delta='%'),
+        'rx1day': dict(pct_change=True, cmap_baseline='YlGnBu',
+                        var_title='Max 1-Day Precipitation', unit_baseline='mm', unit_delta='%'),
+    }
+    composite_maps_made = 0
+    for idx_name, (var, reducer) in index_map.items():
+        cfg_c = composite_cfg.get(idx_name)
+        if cfg_c is None:
+            continue
+        try:
+            baseline_ref = ref_cache.get(var, {}).get('ref')
+            if baseline_ref is None:
+                print(f"   ⚠️ composite grid skipped for {idx_name}: no baseline reference field")
+                continue
+            baseline_2d = reducer(baseline_ref)
+
+            scenario_grids_2d = {}
+            for scenario in scenarios:
+                scenario_grids_2d[scenario] = {}
+                for start, end, label, tag in future_intervals:
+                    grids = corrected_grids.get(var, {}).get(scenario, {}).get(tag, {})
+                    if not grids:
+                        continue
+                    per_model = [reducer(da) for da in grids.values()]
+                    scenario_grids_2d[scenario][tag] = xr.concat(per_model, dim='model').mean(dim='model')
+
+            composite_path = os.path.join(graphs_dir, f'composite_{idx_name}.png')
+            make_composite_grid_map(
+                baseline_2d, scenario_grids_2d, scenarios, period_order,
+                geom_native, districts_gdf, composite_path,
+                add_satellite=add_satellite, **cfg_c)
+            composite_maps_made += 1
+        except Exception as e:
+            print(f"⚠️ composite grid map for {idx_name} failed: {e}")
+            traceback.print_exc()
+    print(f"✅ Composite grid maps saved: {composite_maps_made}")
+
     # ── Model agreement & sensitivity maps ──────────────────────────────
     # For every variable/scenario/period: % of models agreeing on the
     # direction of change vs baseline, inter-model spread, and
     # signal-to-noise ratio. See agreement_utils.py's module docstring for
     # what these mean; see the earlier AJK conversation for the fuller
     # explanation this was originally built against.
+    from agreement_utils import compute_agreement_array
     agreement_maps_made = 0
+    agreement_composite_cfg = {'tas': 'Mean Temperature', 'pr': 'Precipitation'}
     for var in variables:
         cfg = _CFG[var]
+        agreement_grids_2d = {s: {} for s in scenarios}  # for the composite grid below
         for scenario in scenarios:
             for start, end, label, tag in future_intervals:
                 grids = corrected_grids.get(var, {}).get(scenario, {}).get(tag, {})
@@ -467,9 +539,27 @@ def run_pipeline(params):
                     agreement_maps_made += make_agreement_sensitivity_maps(
                         var, cfg, scenario, tag, start, end, ref_cache[var]['ref'], grids,
                         geom_native, maps_dir, make_spatial_map, add_satellite=add_satellite)
+                    # Reuses the same stack computation to also grab the raw
+                    # agreement field for the composite grid, rather than
+                    # recomputing it from scratch a second time.
+                    agree_da, _used = compute_agreement_array(
+                        var, scenario, tag, start, end, ref_cache[var]['ref'], grids)
+                    if agree_da is not None:
+                        agreement_grids_2d[scenario][tag] = agree_da
                 except Exception as e:
                     print(f"⚠️ agreement/sensitivity maps for {var}/{scenario}/{tag} failed: {e}")
                     traceback.print_exc()
+
+        if var in agreement_composite_cfg:
+            try:
+                composite_agree_path = os.path.join(graphs_dir, f'composite_{var}_model_agreement.png')
+                make_composite_agreement_grid(
+                    agreement_grids_2d, scenarios, period_order,
+                    geom_native, districts_gdf, composite_agree_path,
+                    var_title=agreement_composite_cfg[var], add_satellite=add_satellite)
+            except Exception as e:
+                print(f"⚠️ composite agreement grid for {var} failed: {e}")
+                traceback.print_exc()
     print(f"✅ Model agreement/sensitivity maps saved: {agreement_maps_made}")
 
     # ── Data-availability summary ────────────────────────────────────────

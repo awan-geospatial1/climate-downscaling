@@ -115,6 +115,25 @@ def compute_agreement_and_sensitivity(stack):
     return agreement_pct, spread, snr
 
 
+def compute_agreement_array(var, scenario, tag, start, end, baseline_da, grids_by_model):
+    """
+    Same statistics as make_agreement_sensitivity_maps below, but returns
+    the raw agreement (lat, lon) DataArray instead of saving a PNG — used
+    to assemble the composite scenario x period agreement grid, so this
+    doesn't re-derive the stack/compute logic a second time.
+
+    Returns (agreement_da, used_models) or (None, used_models) if fewer
+    than 2 models were usable for this cell.
+    """
+    change_mode = 'percent' if var == 'pr' else 'absolute'
+    stack, used_models, base_clim = per_model_change_stack(
+        var, baseline_da, grids_by_model, start, end, change_mode)
+    if stack is None:
+        return None, used_models
+    agreement, _spread, _snr = compute_agreement_and_sensitivity(stack)
+    return base_clim.copy(data=agreement), used_models
+
+
 def make_agreement_sensitivity_maps(var, cfg, scenario, tag, start, end, baseline_da,
                                      grids_by_model, geom_native, maps_dir,
                                      make_spatial_map_fn, add_satellite=False):
