@@ -38,9 +38,18 @@ PR_MIN_BASELINE_MM = 30.0
 
 def _annual_climatology(da, agg):
     """(lat, lon) climatology: mean-of-annual-means (agg='mean', for
-    temperature) or mean-of-annual-totals (agg='sum', for precipitation)."""
+    temperature) or mean-of-annual-totals (agg='sum', for precipitation).
+
+    FIX: explicitly transpose to ('lat', 'lon') — resample()/mean() don't
+    guarantee axis order, and a caller that got ('lon', 'lat') back here
+    would silently propagate that transposed order into base_clim, the
+    per-model change stack, and ultimately the agreement/spread/snr
+    DataArrays handed to make_spatial_map (which is exactly what produced
+    every "Data shape (X, Y) must match shape of object (Y, X)" error in a
+    real run). Pinning the order here means every downstream consumer in
+    this module can rely on it without re-checking."""
     annual = da.resample(time='YS').sum() if agg == 'sum' else da.resample(time='YS').mean()
-    return annual.mean(dim='time')
+    return annual.mean(dim='time').transpose('lat', 'lon')
 
 
 def per_model_change_stack(var, baseline_da, grids_by_model, start, end, change_mode):
