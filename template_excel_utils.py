@@ -268,15 +268,80 @@ def _pick_threshold_key(precip_thresholds, target=20.0):
 def _sheet_precipitation_stats(wb, results, scenarios, future_intervals, precip_thresholds):
     ws = wb.create_sheet('Precipitation Stats and Graph')
     periods = _period_labels(future_intervals)
+
+    # ── Totals & extremes summary block ─────────────────────────────────
+    # This block used to be entirely missing: compute_precipitation_indices()
+    # / aggregate_across_models() already produce prcptot, wet_season_total,
+    # dry_season_total and rx1day mean/p90 for every period, but this sheet
+    # only ever wrote the per-threshold "wetdays/month" blocks below, so the
+    # workbook never actually reported annual/seasonal totals or the 1-day
+    # extreme amount anywhere — the Temperature sheet has its summary block,
+    # Precipitation didn't. Mirrors that same layout.
+    totals_specs = [
+        ('prcptot', 'Total annual precipitation (mm)'),
+        ('wet_season_total', 'Wet-season total (mm)'),
+        ('dry_season_total', 'Dry-season total (mm)'),
+        ('rx1day_mean', 'Max 1-day precipitation, mean (mm)'),
+        ('rx1day_p90', 'Max 1-day precipitation, p90 (mm)'),
+    ]
+    ws.cell(row=1, column=1, value='Spatial Average')
+    ws.cell(row=1, column=2, value='Baseline')
+    col = 3
+    scen_start_col = {}
+    for scenario in scenarios:
+        scen_start_col[scenario] = col
+        for _, label in periods:
+            ws.cell(row=2, column=col, value=label)
+            col += 1
+        end_col = col - 1
+        ws.merge_cells(start_row=1, start_column=scen_start_col[scenario], end_row=1, end_column=end_col)
+        ws.cell(row=1, column=scen_start_col[scenario], value=scenario.upper())
+    total_cols = col - 1
+    _style_header_row(ws, 1, 1, total_cols)
+    _style_header_row(ws, 2, 2, total_cols)
+
+    row = 3
+    totals_anchor_row = row
+    for key, row_label in totals_specs:
+        ws.cell(row=row, column=1, value=row_label)
+        base_stat = results.get('Baseline', {}).get('precipitation', {}).get(key, {})
+        base_val = base_stat.get('mean') if isinstance(base_stat, dict) else base_stat
+        ws.cell(row=row, column=2, value=round(base_val, 2) if base_val is not None else None)
+        col = 3
+        for scenario in scenarios:
+            for tag, _ in periods:
+                stat = results.get(f'{scenario}_{tag}', {}).get('precipitation', {}).get(key, {})
+                val = stat.get('mean') if isinstance(stat, dict) else None
+                ws.cell(row=row, column=col, value=round(val, 2) if val is not None else None)
+                col += 1
+        row += 1
+
+    try:
+        chart = BarChart()
+        chart.title = 'Spatial-average precipitation totals & extremes'
+        chart.y_axis.title = 'mm'
+        data = Reference(ws, min_col=2, max_col=total_cols, min_row=totals_anchor_row - 1,
+                          max_row=totals_anchor_row + len(totals_specs) - 1)
+        cats = Reference(ws, min_col=1, max_col=1, min_row=totals_anchor_row,
+                          max_row=totals_anchor_row + len(totals_specs) - 1)
+        chart.add_data(data, titles_from_data=True)
+        chart.set_categories(cats)
+        ws.add_chart(chart, f'{get_column_letter(total_cols + 2)}2')
+    except Exception as e:
+        print(f"    [template-excel] precipitation totals chart failed: {e}")
+
+    row_cursor = row + 2  # blank rows before the per-threshold wetdays blocks
+
     if not precip_thresholds:
-        ws.cell(row=1, column=1, value='No precip_thresholds configured - nothing to report here.')
+        ws.cell(row=row_cursor, column=1,
+                value='No precip_thresholds configured - no wetdays-per-month blocks to report.')
+        ws.column_dimensions['A'].width = 30
         return
 
     # Every configured threshold gets its own stacked block below, not just
     # whichever one happens to be closest to 20mm — the ensemble stats for
     # every threshold are already computed by aggregate_across_models, this
     # sheet was just silently dropping all but one of them.
-    row_cursor = 1
     for thr in precip_thresholds:
         key = f'wetdays_per_month_{thr:g}mm'
         ws.cell(row=row_cursor, column=1, value=f'Days/month > {thr:g}mm')
@@ -326,7 +391,7 @@ def _sheet_precipitation_stats(wb, results, scenarios, future_intervals, precip_
 
         row_cursor = chart_start_row + 12 + 3  # blank rows before next threshold's block
 
-    ws.column_dimensions['A'].width = 16
+    ws.column_dimensions['A'].width = 30
 
 
 # =========================================================================
