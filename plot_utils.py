@@ -387,7 +387,7 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
                              pct_change=False, smooth_sigma=1.0,
                              add_satellite=True, tile_zoom=8):
     """
-    Report-style composite: one large baseline panel (own colorbar) plus
+    AJK-report-style composite: one large baseline panel (own colorbar) plus
     a grid of scenario x period change panels sharing one diverging colorbar.
 
     Rows = scenario_order, columns = period_order — both are just lists, so
@@ -421,6 +421,19 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
     base_smooth = _smooth_field(base_sorted.values, sigma=smooth_sigma)
     lonb, latb = base_sorted['lon'].values, base_sorted['lat'].values
 
+    # FIX: pct-change masking used a fixed absolute threshold (1e-6), so a
+    # baseline value that's tiny-but-technically-nonzero (e.g. 1e-5 in a
+    # region where "typical" baseline is in the hundreds) slipped through
+    # as "valid" and produced a finite but astronomical % change (division
+    # by a near-zero number) — one such cell can blow the color scale out
+    # to +/-millions of percent and wash out every other, legitimate value
+    # on the map. Masking relative to the baseline's own typical scale (3%
+    # of its 75th percentile magnitude) catches these properly; genuinely
+    # meaningful small-but-real baseline values elsewhere aren't affected.
+    finite_base = base_smooth[np.isfinite(base_smooth)]
+    mask_threshold = max(1e-6, 0.03 * float(np.nanpercentile(np.abs(finite_base), 75))) \
+        if finite_base.size else 1e-6
+
     # First pass: compute every cell's delta field and pool them so the whole
     # grid can share one color range that represents every real value in it.
     cell_fields, all_finite_vals = {}, []
@@ -433,7 +446,7 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
             vals_smooth = _smooth_field(da_sorted.values, sigma=smooth_sigma)
             if pct_change:
                 with np.errstate(divide='ignore', invalid='ignore'):
-                    delta = np.where(np.abs(base_smooth) > 1e-6,
+                    delta = np.where(np.abs(base_smooth) > mask_threshold,
                                       (vals_smooth - base_smooth) / np.abs(base_smooth) * 100,
                                       np.nan)
             else:
@@ -446,14 +459,22 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
     # FIX: this used to clip vmax to the 98th percentile of |delta|, which
     # meant the top ~2% of cells (by magnitude) got flattened into the
     # colorbar's "extend" cap color instead of showing their real value —
-    # exactly what produced the solid, undifferentiated dark-navy blocks in
-    # earlier renders (several districts with genuinely different large
-    # negative % changes were all indistinguishable off-scale-cap color).
-    # Using the true max means every real value in the data gets its own
-    # distinct color on the legend; nothing is clipped, so 'extend' is no
-    # longer needed either.
+    # part of what produced the solid, undifferentiated dark-navy blocks in
+    # earlier renders. Switching to the true max sounds like the fix, but
+    # it isn't safe on its own: a single cell near the (now relative)
+    # masking threshold can still produce a huge-but-finite % change and
+    # wash out the whole scale (verified this empirically — see PR
+    # discussion). So: keep robust percentile clipping to protect the
+    # overall readability of the legend, but raise it from 98th to 99.5th
+    # (tighter than before) now that the improved relative masking above
+    # already screens out the near-zero-baseline cells that used to be the
+    # actual source of the extreme values being clipped in the first place.
+    # Genuinely extreme survivors are still shown via the 'extend' cap
+    # rather than silently — and masked (NaN) cells get hatched below
+    # rather than left blank, so nothing is invisible, even if a few
+    # outlier cells share one cap color.
     if all_finite_vals:
-        vmax = float(np.nanmax(np.abs(np.concatenate(all_finite_vals)))) or 1.0
+        vmax = float(np.nanpercentile(np.abs(np.concatenate(all_finite_vals)), 99.5)) or 1.0
     else:
         vmax = 1.0
     vmin = -vmax
@@ -483,7 +504,7 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
                            wspace=0.05, hspace=0.15, top=top_frac, bottom=0.08)
 
     change_word = '% change' if pct_change else 'change'
-    fig.suptitle(f'{var_title}', fontsize=13, fontweight='bold',
+    fig.suptitle(f'{var_title} — AJK', fontsize=13, fontweight='bold',
                  y=1 - (0.32 / fig_h_total))
     scenario_label = ' vs '.join(s.upper() for s in scenario_order)
     fig.text(0.5, 1 - (0.65 / fig_h_total),
@@ -533,14 +554,17 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
                 # norm), only the colorbar's numbers were wrong. Passing an
                 # explicit boundary array spanning vmin..vmax fixes this for
                 # every panel and makes the colorbar match what's drawn.
-                # extend='neither': vmax is now the true max (see above), so
-                # nothing actually falls outside [vmin, vmax] anymore.
+                # extend='both': vmax is a robust 99.5th-percentile clip (not
+                # the true max — see note above), so a handful of outlier
+                # cells can still legitimately fall outside [vmin, vmax] and
+                # need the cap-color arrows.
                 cf_grid = ax.contourf(lon, lat, delta, levels=np.linspace(vmin, vmax, 61),
-                                       cmap=diverging_cmap, transform=proj, extend='neither', zorder=3)
+                                       cmap=diverging_cmap, transform=proj, extend='both', zorder=3)
                 _clip_to_aoi(cf_grid, geom_native, ax)
                 # Mark cells where pct-change is mathematically undefined
-                # (baseline ~0) with hatching instead of leaving them blank —
-                # "masked" now means visibly masked, not silently dropped.
+                # (baseline ~0, relative to its own typical scale) with
+                # hatching instead of leaving them blank — "masked" now
+                # means visibly masked, not silently dropped.
                 if pct_change:
                     _hatch_masked_region(ax, lon, lat, ~np.isfinite(delta), proj)
             shp_outer.boundary.plot(ax=ax, color='black', linewidth=0.8, transform=proj, zorder=6)
@@ -578,9 +602,9 @@ def make_composite_metric_grid(value_grids, scenario_order, period_order,
                                 geom_native, districts_gdf, out_path,
                                 title_line1, colorbar_label, cmap='viridis',
                                 vmin=None, vmax=None, robust_pct=98,
-                                extend='neither', add_satellite=True, tile_zoom=8):
+                                extend='max', add_satellite=True, tile_zoom=8):
     """
-    Generic Report-style scenario x period composite grid, NO baseline
+    Generic AJK-report-style scenario x period composite grid, NO baseline
     panel — this is what make_composite_agreement_grid now delegates to,
     and what the sensitivity-spread / SNR composites use too (previously
     those two only ever got individual per-cell PNGs, never assembled into
@@ -623,13 +647,14 @@ def make_composite_metric_grid(value_grids, scenario_order, period_order,
             if finite.size:
                 all_finite.append(finite)
 
-    # FIX: this used to clip vmax to the robust_pct percentile, which could
-    # flatten the highest-magnitude cells into the "extend" cap color
-    # instead of showing their real value — same issue as
-    # make_composite_grid_map's old 98th-percentile clip. Using the true max
-    # means every real value in the grid gets its own distinct color.
+    # FIX: switching this to the true max isn't safe on its own (verified
+    # empirically — see make_composite_grid_map's note above for the same
+    # issue): a single outlier cell can dominate the whole scale. Keep
+    # robust percentile clipping (robust_pct, default 98th) so the legend
+    # stays readable; genuinely extreme survivors are shown via the
+    # 'extend' cap rather than silently.
     if vmin is None or vmax is None:
-        vmax = float(np.nanmax(np.concatenate(all_finite))) if all_finite else 1.0
+        vmax = float(np.nanpercentile(np.concatenate(all_finite), robust_pct)) if all_finite else 1.0
         vmax = vmax or 1.0
         vmin = 0.0
 
@@ -701,7 +726,7 @@ def make_composite_agreement_grid(agreement_grids, scenario_order, period_order,
                                    var_title, add_satellite=True, tile_zoom=8,
                                    vmin=20, vmax=100):
     """
-    Report-style model-agreement composite — thin wrapper over
+    AJK-report-style model-agreement composite — thin wrapper over
     make_composite_metric_grid (fixed 20-100 scale, RdYlGn), kept as its
     own named function since it's what main.py and any existing callers
     already import.
