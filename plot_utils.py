@@ -163,6 +163,50 @@ def _smooth_field(data, sigma=1.0):
         return np.where(wt > 0.01, sm / wt, np.nan)
 
 
+def _nice_ticks(vmin, vmax, n=9):
+    """
+    n evenly-spaced tick values spanning exactly [vmin, vmax], rounded to a
+    sensible number of significant figures instead of matplotlib's default
+    colorbar tick locator, which can land on ugly, hard-to-read decimals
+    (e.g. "5.136, 5.184, 5.232..."). Always includes the exact vmin/vmax
+    endpoints (rounding only the interior ticks) so the legend's stated
+    range still matches what the color scale actually spans.
+    """
+    raw = np.linspace(vmin, vmax, n)
+    span = vmax - vmin
+    if span <= 0:
+        return raw
+    # Pick a rounding precision from the span's order of magnitude so ticks
+    # read as clean numbers (e.g. spans of 100s round to whole numbers,
+    # spans under 1 round to 2-3 decimals) without collapsing distinct
+    # ticks into duplicates for very small spans.
+    decimals = max(0, int(np.ceil(-np.log10(span / n))) + 1)
+    ticks = np.round(raw, decimals)
+    ticks[0], ticks[-1] = vmin, vmax
+    return ticks
+
+
+def _hatch_masked_region(ax, lon, lat, mask, proj, hatch='///', zorder=4):
+    """
+    Overlay diagonal hatching over cells where `mask` is True (e.g. pct-change
+    is undefined because baseline is ~0) — previously these NaN cells were
+    just left uncolored (blank, matching the basemap), which is easy to
+    mistake for "no interesting data" rather than "this value can't be
+    expressed on this legend, at all" (division by ~0 baseline). Hatching
+    makes that distinction visible without inventing a fake color/value for
+    a mathematically undefined quantity — this is what "all the values
+    inside the masked region" should look like: masked cells are visibly
+    marked as masked rather than silently dropped.
+    """
+    if not mask.any():
+        return
+    try:
+        ax.contourf(lon, lat, mask.astype(float), levels=[0.5, 1.5], colors='none',
+                    hatches=[hatch], transform=proj, zorder=zorder)
+    except Exception:
+        pass
+
+
 def _add_background(ax, add_satellite, tile_zoom):
     """Satellite tiles if requested and reachable, else plain land/ocean fill.
     Never raises — a background failure should not stop the map from saving.
@@ -343,7 +387,7 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
                              pct_change=False, smooth_sigma=1.0,
                              add_satellite=True, tile_zoom=8):
     """
-    AJK-report-style composite: one large baseline panel (own colorbar) plus
+    Report-style composite: one large baseline panel (own colorbar) plus
     a grid of scenario x period change panels sharing one diverging colorbar.
 
     Rows = scenario_order, columns = period_order — both are just lists, so
@@ -378,7 +422,7 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
     lonb, latb = base_sorted['lon'].values, base_sorted['lat'].values
 
     # First pass: compute every cell's delta field and pool them so the whole
-    # grid can share one symmetric, outlier-robust color range.
+    # grid can share one color range that represents every real value in it.
     cell_fields, all_finite_vals = {}, []
     for scenario in scenario_order:
         for tag, _label in period_order:
@@ -399,8 +443,17 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
             if finite.size:
                 all_finite_vals.append(finite)
 
+    # FIX: this used to clip vmax to the 98th percentile of |delta|, which
+    # meant the top ~2% of cells (by magnitude) got flattened into the
+    # colorbar's "extend" cap color instead of showing their real value —
+    # exactly what produced the solid, undifferentiated dark-navy blocks in
+    # earlier renders (several districts with genuinely different large
+    # negative % changes were all indistinguishable off-scale-cap color).
+    # Using the true max means every real value in the data gets its own
+    # distinct color on the legend; nothing is clipped, so 'extend' is no
+    # longer needed either.
     if all_finite_vals:
-        vmax = float(np.nanpercentile(np.abs(np.concatenate(all_finite_vals)), 98)) or 1.0
+        vmax = float(np.nanmax(np.abs(np.concatenate(all_finite_vals)))) or 1.0
     else:
         vmax = 1.0
     vmin = -vmax
@@ -409,13 +462,28 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
     title_band_in = 0.9  # fixed absolute height regardless of n_rows, so a 1-row
                           # grid doesn't compress/overlap the two title lines
     fig_h_total = fig_h + title_band_in
-    fig = plt.figure(figsize=(3.4 + 2.9 * n_cols, fig_h_total), facecolor='white')
+    # FIX: the baseline panel spans gs[:, 0] -- ALL n_rows -- but this used
+    # to hard-code its width_ratio to a flat 1.5 regardless of n_rows, and
+    # figure width only grew with n_cols. Every regular column is 1 row tall
+    # with width_ratio=1; the baseline column is n_rows tall, so keeping its
+    # width_ratio fixed at 1.5 meant its cell got proportionally TALLER and
+    # NARROWER as more scenario rows were added. cartopy's aspect-locked
+    # GeoAxes can't stretch to fill a mismatched cell — it shrinks to the
+    # correct lat/lon aspect and centers itself, which is exactly what left
+    # growing blank margins above and below the baseline map (worse the
+    # more scenarios you add). Scaling width_ratio by n_rows keeps the same
+    # per-row aspect as the original 1-row design; the figure width has to
+    # grow with it too (in the same 2.9in/unit the row heights already use)
+    # so this doesn't just steal width from the regular columns instead.
+    baseline_width_ratio = 1.5 * n_rows
+    fig_w = 2.9 * (baseline_width_ratio + n_cols) - 0.95
+    fig = plt.figure(figsize=(fig_w, fig_h_total), facecolor='white')
     top_frac = fig_h / fig_h_total
-    gs = fig.add_gridspec(n_rows, n_cols + 1, width_ratios=[1.5] + [1] * n_cols,
+    gs = fig.add_gridspec(n_rows, n_cols + 1, width_ratios=[baseline_width_ratio] + [1] * n_cols,
                            wspace=0.05, hspace=0.15, top=top_frac, bottom=0.08)
 
     change_word = '% change' if pct_change else 'change'
-    fig.suptitle(f'{var_title} — AJK', fontsize=13, fontweight='bold',
+    fig.suptitle(f'{var_title}', fontsize=13, fontweight='bold',
                  y=1 - (0.32 / fig_h_total))
     scenario_label = ' vs '.join(s.upper() for s in scenario_order)
     fig.text(0.5, 1 - (0.65 / fig_h_total),
@@ -438,7 +506,8 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
     gl0.top_labels = False; gl0.right_labels = False
     gl0.xlocator = mticker.MaxNLocator(nbins=4)
     gl0.xlabel_style = {'size': 8}
-    fig.colorbar(cf_base, ax=ax_base, location='left', shrink=0.85, pad=0.14, label=unit_baseline)
+    cbar_base = fig.colorbar(cf_base, ax=ax_base, location='left', shrink=0.85, pad=0.14, label=unit_baseline)
+    cbar_base.set_ticks(_nice_ticks(float(np.nanmin(base_smooth)), float(np.nanmax(base_smooth))))
 
     # ── Scenario x period grid (shared diverging colorbar) ─────────────────
     grid_axes = []
@@ -452,9 +521,28 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
             _add_background(ax, add_satellite, tile_zoom)
             if cell is not None:
                 lon, lat, delta = cell
-                cf_grid = ax.contourf(lon, lat, delta, levels=60, cmap=diverging_cmap,
-                                       vmin=vmin, vmax=vmax, transform=proj, extend='both', zorder=3)
+                # FIX: levels=60 (a bare int) makes contourf auto-compute
+                # boundaries from THIS panel's own local data range and
+                # ignore vmin/vmax entirely for where those boundaries sit.
+                # Since cf_grid gets overwritten every iteration and only
+                # the LAST panel's ContourSet is handed to fig.colorbar()
+                # below, the shared colorbar ended up showing that one
+                # panel's own tiny local range (e.g. "5.136-5.520") instead
+                # of the true, intended [vmin, vmax] scale — the fill
+                # colors were still correct (they follow vmin/vmax via the
+                # norm), only the colorbar's numbers were wrong. Passing an
+                # explicit boundary array spanning vmin..vmax fixes this for
+                # every panel and makes the colorbar match what's drawn.
+                # extend='neither': vmax is now the true max (see above), so
+                # nothing actually falls outside [vmin, vmax] anymore.
+                cf_grid = ax.contourf(lon, lat, delta, levels=np.linspace(vmin, vmax, 61),
+                                       cmap=diverging_cmap, transform=proj, extend='neither', zorder=3)
                 _clip_to_aoi(cf_grid, geom_native, ax)
+                # Mark cells where pct-change is mathematically undefined
+                # (baseline ~0) with hatching instead of leaving them blank —
+                # "masked" now means visibly masked, not silently dropped.
+                if pct_change:
+                    _hatch_masked_region(ax, lon, lat, ~np.isfinite(delta), proj)
             shp_outer.boundary.plot(ax=ax, color='black', linewidth=0.8, transform=proj, zorder=6)
             if districts_gdf is not None:
                 districts_gdf.boundary.plot(ax=ax, color='white', linewidth=0.6, transform=proj, zorder=6)
@@ -476,8 +564,9 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
                             bbox=dict(boxstyle='round,pad=0.3', facecolor=color, edgecolor='none'))
 
     if cf_grid is not None:
-        fig.colorbar(cf_grid, ax=grid_axes, location='right', shrink=0.85, pad=0.02,
+        cbar_grid = fig.colorbar(cf_grid, ax=grid_axes, location='right', shrink=0.85, pad=0.02,
                       label=f'{var_title} {change_word}' + (f' ({unit_delta})' if unit_delta and not pct_change else ''))
+        cbar_grid.set_ticks(_nice_ticks(vmin, vmax))
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches='tight', facecolor='white')
@@ -485,27 +574,32 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
     print(f"🗺️  Composite grid map saved ({n_rows}x{n_cols}): {out_path}")
 
 
-def make_composite_agreement_grid(agreement_grids, scenario_order, period_order,
-                                   geom_native, districts_gdf, out_path,
-                                   var_title, add_satellite=True, tile_zoom=8,
-                                   vmin=20, vmax=100):
+def make_composite_metric_grid(value_grids, scenario_order, period_order,
+                                geom_native, districts_gdf, out_path,
+                                title_line1, colorbar_label, cmap='viridis',
+                                vmin=None, vmax=None, robust_pct=98,
+                                extend='neither', add_satellite=True, tile_zoom=8):
     """
-    AJK-report-style model-agreement composite: NO baseline panel (unlike
-    make_composite_grid_map) — just a scenario x period grid of "% of
-    models agreeing on direction of change" panels sharing one colorbar,
-    matching the reference pr_model_agreement.png layout.
+    Generic Report-style scenario x period composite grid, NO baseline
+    panel — this is what make_composite_agreement_grid now delegates to,
+    and what the sensitivity-spread / SNR composites use too (previously
+    those two only ever got individual per-cell PNGs, never assembled into
+    this grid at all — main.py imported make_composite_agreement_grid but
+    had no equivalent call for spread/SNR).
 
-    Rows = scenario_order, columns = period_order — both plain lists, so
-    this auto-sizes to however many scenarios (3, 4, ...) and periods
-    (3, 4, 5, ...) were actually selected, same as make_composite_grid_map.
-
-    agreement_grids : {scenario: {tag: xr.DataArray(lat, lon) or None}} —
-                        % agreement fields, e.g. from
-                        agreement_utils.compute_agreement_array. A missing
-                        /None cell is left blank rather than erroring.
-    vmin/vmax       : fixed color range (default 20-100, matching the
-                        reference figure) rather than data-driven, since
-                        "% agreement" has a meaningful fixed scale.
+    value_grids : {scenario: {tag: xr.DataArray(lat, lon) or None}}
+    vmin/vmax   : pass both for a fixed scale (agreement is naturally
+                  0-100%). Leave both None for a data-driven scale spanning
+                  the true 0..max of every finite cell in the grid, so no
+                  value gets clipped into the "extend" cap color — right for
+                  spread/SNR, which are magnitude-only (never negative),
+                  unlike the % change grids in make_composite_grid_map which
+                  need a symmetric diverging scale.
+    extend      : colorbar cap style. 'neither' (default) since the
+                  data-driven vmax is the true max, so nothing is clipped.
+                  Agreement uses a fixed 20-100 scale where values genuinely
+                  fall below 20, so make_composite_agreement_grid passes
+                  'both'.
     """
     n_rows, n_cols = len(scenario_order), len(period_order)
     proj = ccrs.PlateCarree()
@@ -515,6 +609,30 @@ def make_composite_agreement_grid(agreement_grids, scenario_order, period_order,
     buf = 0.25
     extent = [minx - buf, maxx + buf, miny - buf, maxy + buf]
 
+    prepped = {}
+    all_finite = []
+    for scenario in scenario_order:
+        for tag, _label in period_order:
+            da = value_grids.get(scenario, {}).get(tag)
+            if da is None:
+                continue
+            da_sorted = da.sortby('lat').sortby('lon').transpose('lat', 'lon')
+            vals = _smooth_field(da_sorted.values, sigma=1.0)
+            prepped[(scenario, tag)] = (da_sorted['lon'].values, da_sorted['lat'].values, vals)
+            finite = vals[np.isfinite(vals)]
+            if finite.size:
+                all_finite.append(finite)
+
+    # FIX: this used to clip vmax to the robust_pct percentile, which could
+    # flatten the highest-magnitude cells into the "extend" cap color
+    # instead of showing their real value — same issue as
+    # make_composite_grid_map's old 98th-percentile clip. Using the true max
+    # means every real value in the grid gets its own distinct color.
+    if vmin is None or vmax is None:
+        vmax = float(np.nanmax(np.concatenate(all_finite))) if all_finite else 1.0
+        vmax = vmax or 1.0
+        vmin = 0.0
+
     fig_h = 2.9 * n_rows + 1.4
     title_band_in = 0.9
     fig_h_total = fig_h + title_band_in
@@ -522,8 +640,7 @@ def make_composite_agreement_grid(agreement_grids, scenario_order, period_order,
     top_frac = fig_h / fig_h_total
     gs = fig.add_gridspec(n_rows, n_cols, wspace=0.05, hspace=0.15, top=top_frac, bottom=0.08)
 
-    fig.suptitle(f'{var_title} — Model Agreement — AJK', fontsize=13, fontweight='bold',
-                 y=1 - (0.32 / fig_h_total))
+    fig.suptitle(title_line1, fontsize=13, fontweight='bold', y=1 - (0.32 / fig_h_total))
     scenario_label = '  vs  '.join(s.upper() for s in scenario_order)
     fig.text(0.5, 1 - (0.65 / fig_h_total), scenario_label, ha='center', fontsize=10.5)
 
@@ -533,14 +650,19 @@ def make_composite_agreement_grid(agreement_grids, scenario_order, period_order,
             ax = fig.add_subplot(gs[r, c], projection=proj)
             ax.set_extent(extent, crs=proj)
             grid_axes.append(ax)
-            da = agreement_grids.get(scenario, {}).get(tag)
             _add_background(ax, add_satellite, tile_zoom)
-            if da is not None:
-                da_sorted = da.sortby('lat').sortby('lon').transpose('lat', 'lon')
-                vals = _smooth_field(da_sorted.values, sigma=1.0)
-                cf_grid = ax.contourf(da_sorted['lon'].values, da_sorted['lat'].values, vals,
-                                       levels=60, cmap='RdYlGn', vmin=vmin, vmax=vmax,
-                                       transform=proj, extend='both', zorder=3)
+            cell = prepped.get((scenario, tag))
+            if cell is not None:
+                lon, lat, vals = cell
+                # FIX: same bug as make_composite_grid_map above — levels=60
+                # as a bare int ignores vmin/vmax for boundary placement, so
+                # the shared colorbar ends up reflecting only the LAST
+                # panel's own local data range. Exactly what produced the
+                # "1e-11+1e2" degenerate colorbar on the tas model-agreement
+                # composite (that field is ~100% almost everywhere, so its
+                # last panel's local range was a sliver of a percent wide).
+                cf_grid = ax.contourf(lon, lat, vals, levels=np.linspace(vmin, vmax, 61),
+                                       cmap=cmap, transform=proj, extend=extend, zorder=3)
                 _clip_to_aoi(cf_grid, geom_native, ax)
             shp_outer.boundary.plot(ax=ax, color='black', linewidth=0.8, transform=proj, zorder=6)
             if districts_gdf is not None:
@@ -564,10 +686,28 @@ def make_composite_agreement_grid(agreement_grids, scenario_order, period_order,
                             bbox=dict(boxstyle='round,pad=0.3', facecolor=color, edgecolor='none'))
 
     if cf_grid is not None:
-        fig.colorbar(cf_grid, ax=grid_axes, location='right', shrink=0.85, pad=0.02,
-                      label='% of models agreeing on direction')
+        cbar = fig.colorbar(cf_grid, ax=grid_axes, location='right', shrink=0.85, pad=0.02,
+                      label=colorbar_label)
+        cbar.set_ticks(_nice_ticks(vmin, vmax))
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close(fig)
-    print(f"🗺️  Composite agreement grid map saved ({n_rows}x{n_cols}): {out_path}")
+    print(f"🗺️  Composite grid map saved ({n_rows}x{n_cols}): {out_path}")
+
+
+def make_composite_agreement_grid(agreement_grids, scenario_order, period_order,
+                                   geom_native, districts_gdf, out_path,
+                                   var_title, add_satellite=True, tile_zoom=8,
+                                   vmin=20, vmax=100):
+    """
+    Report-style model-agreement composite — thin wrapper over
+    make_composite_metric_grid (fixed 20-100 scale, RdYlGn), kept as its
+    own named function since it's what main.py and any existing callers
+    already import.
+    """
+    make_composite_metric_grid(
+        agreement_grids, scenario_order, period_order, geom_native, districts_gdf,
+        out_path, title_line1=f'{var_title} — Model Agreement — AJK',
+        colorbar_label='% of models agreeing on direction', cmap='RdYlGn',
+        vmin=vmin, vmax=vmax, extend='both', add_satellite=add_satellite, tile_zoom=tile_zoom)
