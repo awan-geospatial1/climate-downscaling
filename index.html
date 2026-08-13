@@ -520,8 +520,9 @@ function initOptionsForm(){
   buildChoiceGrid('return-periods-grid', 'return_periods', RETURN_PERIOD_OPTIONS, [10,25,50,100]);
   buildChoiceGrid('wet-months-grid', 'wet_months', MONTH_OPTIONS, ['6','7','8','9']);
   buildChoiceGrid('dry-months-grid', 'dry_months', MONTH_OPTIONS, ['12','1','2']);
-  addIntervalRow('2041-01-01','2060-12-31','Mid-century','2041-2060');
-  addIntervalRow('2081-01-01','2100-12-31','End-century','2081-2100');
+  addIntervalRow('2026-01-01','2050-12-31','Near-century','2026-2050');  
+  addIntervalRow('2051-01-01','2075-12-31','Mid-century','2051-2075');
+  addIntervalRow('2076-01-01','2100-12-31','End-century','2076-2100');
 }
 window.addEventListener('load', initOptionsForm);
 
