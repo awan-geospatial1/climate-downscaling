@@ -6,7 +6,9 @@ from gee_utils import fetch_reference, fetch_cmip6, regrid_to_reference, clean_t
 from qdm_utils import train_qdm, apply_qdm, adjust_wet_day_frequency
 from indices_utils import (compute_temperature_indices, compute_precipitation_indices, aggregate_across_models,
                            daily_spatial_series, daily_spatial_ensemble)
-from plot_utils import plot_fan_chart, make_spatial_map, plot_index_comparison, make_composite_grid_map, make_composite_agreement_grid
+from plot_utils import (plot_fan_chart, make_spatial_map, plot_index_comparison,
+                         make_composite_grid_map, make_composite_agreement_grid,
+                         make_composite_metric_grid)
 from ensemble_utils import compute_ensemble_mean, compute_ensemble_max, save_ensemble_netcdf
 from agreement_utils import make_agreement_sensitivity_maps
 from template_excel_utils import write_template_style_excel
@@ -231,7 +233,7 @@ def run_pipeline(params):
                                                  ref_cache['tasmin']['ref'], b_start, b_end, temp_thresholds)
     precip_baseline = compute_precipitation_indices(ref_cache['pr']['ref'], b_start, b_end,
                                                       precip_thresholds, wet_months, dry_months,
-                                                      return_periods, n_boot)
+                                                      return_periods, n_boot, progress_label='Baseline')
     print("✅ Baseline indices computed.")
 
     # FIX (pre-existing bug, not introduced by anything above): this used to
@@ -272,7 +274,8 @@ def run_pipeline(params):
                 pr = corrected_grids['pr'][scenario][tag][model]
                 temp_list.append(compute_temperature_indices(tas, tasmax, tasmin, start, end, temp_thresholds))
                 precip_list.append(compute_precipitation_indices(pr, start, end, precip_thresholds,
-                                                                   wet_months, dry_months, return_periods, n_boot))
+                                                                   wet_months, dry_months, return_periods, n_boot,
+                                                                   progress_label=f'{model}/{scenario}/{tag}'))
                 print(f"   ✅ {model} indices done ({len(temp_list)}/{len(models)})")
             results[key] = {
                 'temperature': aggregate_across_models(temp_list, return_periods),
@@ -424,13 +427,22 @@ def run_pipeline(params):
     # ── Spatial maps ────────────────────────────────────────────────────
     # NOTE: reducers here must return a 2D (lat, lon) DataArray.
     index_map = {
-        'annual_mean_tas': ('tas', lambda da: xci.tg_mean(da, freq='YS').mean(dim='time')),
+        # FIX: tas/tasmax/tasmin are Kelvin end-to-end in this pipeline
+        # (config.py: ref_units='K', clip_min/max=200/350) — these reducers
+        # used to hand back raw Kelvin values with no conversion, which is
+        # exactly why the composite baseline panel showed ~263-292 labeled
+        # "°C". The -273.15 here only affects ABSOLUTE-value displays
+        # (baseline panel, individual annual_mean_tas*.png maps); every
+        # delta/change computation downstream (make_composite_grid_map,
+        # agreement_utils) subtracts two of these, so a constant per-field
+        # offset cancels out and was never affected by this bug.
+        'annual_mean_tas': ('tas', lambda da: xci.tg_mean(da, freq='YS').mean(dim='time') - 273.15),
         'prcptot': ('pr', lambda da: xci.precip_accumulation(da, freq='YS').mean(dim='time')),
         # Extremes — same reducer pattern (per-gridcell annual climatology),
         # just different xclim functions. tasmax/tasmin capture hot/cold
         # extremes, rx1day captures the wettest single day per year.
-        'annual_mean_tasmax': ('tasmax', lambda da: xci.tx_mean(da, freq='YS').mean(dim='time')),
-        'annual_mean_tasmin': ('tasmin', lambda da: xci.tn_mean(da, freq='YS').mean(dim='time')),
+        'annual_mean_tasmax': ('tasmax', lambda da: xci.tx_mean(da, freq='YS').mean(dim='time') - 273.15),
+        'annual_mean_tasmin': ('tasmin', lambda da: xci.tn_mean(da, freq='YS').mean(dim='time') - 273.15),
         'rx1day': ('pr', lambda da: xci.max_1day_precipitation_amount(da, freq='YS').mean(dim='time')),
     }
 
@@ -521,12 +533,25 @@ def run_pipeline(params):
     # signal-to-noise ratio. See agreement_utils.py's module docstring for
     # what these mean; see the earlier AJK conversation for the fuller
     # explanation this was originally built against.
-    from agreement_utils import compute_agreement_array
+    #
+    # FIX: this used to only ever assemble a composite scenario x period
+    # GRID for model_agreement (via make_composite_agreement_grid) — spread
+    # and SNR got individual per-scenario/period PNGs but were never
+    # collected into the matching composite grid at all, even though that's
+    # exactly the report figure (e.g. pr_sensitivity_spread.png) the pipeline
+    # is meant to produce. Also switched to the single-pass
+    # compute_agreement_and_sensitivity_arrays so the per-model change stack
+    # is computed once per var/scenario/period instead of twice (previously
+    # make_agreement_sensitivity_maps and compute_agreement_array each
+    # recomputed it independently for the same cell).
+    from agreement_utils import compute_agreement_and_sensitivity_arrays
     agreement_maps_made = 0
     agreement_composite_cfg = {'tas': 'Mean Temperature', 'pr': 'Precipitation'}
+    sensitivity_units = {'tas': '°C', 'tasmax': '°C', 'tasmin': '°C', 'pr': '% points'}
     for var in variables:
-        cfg = _CFG[var]
-        agreement_grids_2d = {s: {} for s in scenarios}  # for the composite grid below
+        agreement_grids_2d = {s: {} for s in scenarios}
+        spread_grids_2d = {s: {} for s in scenarios}
+        snr_grids_2d = {s: {} for s in scenarios}
         for scenario in scenarios:
             for start, end, label, tag in future_intervals:
                 grids = corrected_grids.get(var, {}).get(scenario, {}).get(tag, {})
@@ -536,29 +561,69 @@ def run_pipeline(params):
                     continue
                 try:
                     _, maps_dir, _ = scenario_period_dirs(scenario, tag)
-                    agreement_maps_made += make_agreement_sensitivity_maps(
-                        var, cfg, scenario, tag, start, end, ref_cache[var]['ref'], grids,
-                        geom_native, maps_dir, make_spatial_map, add_satellite=add_satellite)
-                    # Reuses the same stack computation to also grab the raw
-                    # agreement field for the composite grid, rather than
-                    # recomputing it from scratch a second time.
-                    agree_da, _used = compute_agreement_array(
+                    agree_da, spread_da, snr_da, used_models = compute_agreement_and_sensitivity_arrays(
                         var, scenario, tag, start, end, ref_cache[var]['ref'], grids)
-                    if agree_da is not None:
-                        agreement_grids_2d[scenario][tag] = agree_da
+                    if agree_da is None:
+                        print(f"    [ERROR] Only {len(used_models)} usable model(s) for "
+                              f"{var}/{scenario}/{tag} agreement/sensitivity; need >= 2, skipping.")
+                        continue
+
+                    specs = [
+                        ('model_agreement', agree_da, 'RdYlGn', '% of models agreeing on direction of change'),
+                        ('sensitivity_spread', spread_da, 'Purples', 'Inter-model spread (std. dev. of change)'),
+                        ('sensitivity_snr', snr_da, 'YlOrBr', 'Signal-to-noise ratio (|mean change| / spread)'),
+                    ]
+                    for suffix, da_2d, cmap, subtitle in specs:
+                        try:
+                            out_path = f'{maps_dir}/{var}_{suffix}_{scenario}_{tag}.png'
+                            make_spatial_map(da_2d, geom_native, out_path,
+                                              title=f'{var} {subtitle} \u2014 {scenario.upper()} ({tag})',
+                                              cmap=cmap, add_satellite=add_satellite)
+                            agreement_maps_made += 1
+                        except Exception as e:
+                            print(f"    [ERROR] {var}/{scenario}/{tag} {suffix} map failed: {e}")
+                    print(f"    used {len(used_models)} model(s) for agreement/sensitivity: {used_models}")
+
+                    agreement_grids_2d[scenario][tag] = agree_da
+                    spread_grids_2d[scenario][tag] = spread_da
+                    snr_grids_2d[scenario][tag] = snr_da
                 except Exception as e:
                     print(f"⚠️ agreement/sensitivity maps for {var}/{scenario}/{tag} failed: {e}")
                     traceback.print_exc()
 
         if var in agreement_composite_cfg:
+            var_title = agreement_composite_cfg[var]
+            unit = sensitivity_units.get(var, '')
             try:
-                composite_agree_path = os.path.join(graphs_dir, f'composite_{var}_model_agreement.png')
                 make_composite_agreement_grid(
                     agreement_grids_2d, scenarios, period_order,
-                    geom_native, districts_gdf, composite_agree_path,
-                    var_title=agreement_composite_cfg[var], add_satellite=add_satellite)
+                    geom_native, districts_gdf,
+                    os.path.join(graphs_dir, f'composite_{var}_model_agreement.png'),
+                    var_title=var_title, add_satellite=add_satellite)
             except Exception as e:
                 print(f"⚠️ composite agreement grid for {var} failed: {e}")
+                traceback.print_exc()
+            try:
+                make_composite_metric_grid(
+                    spread_grids_2d, scenarios, period_order,
+                    geom_native, districts_gdf,
+                    os.path.join(graphs_dir, f'composite_{var}_sensitivity_spread.png'),
+                    title_line1=f'{var_title} \u2014 Sensitivity: Inter-Model Spread \u2014 AJK',
+                    colorbar_label=f'Std. dev. across models ({unit})' if unit else 'Std. dev. across models',
+                    cmap='Purples', add_satellite=add_satellite)
+            except Exception as e:
+                print(f"⚠️ composite sensitivity-spread grid for {var} failed: {e}")
+                traceback.print_exc()
+            try:
+                make_composite_metric_grid(
+                    snr_grids_2d, scenarios, period_order,
+                    geom_native, districts_gdf,
+                    os.path.join(graphs_dir, f'composite_{var}_sensitivity_snr.png'),
+                    title_line1=f'{var_title} \u2014 Sensitivity: Signal-to-Noise Ratio \u2014 AJK',
+                    colorbar_label='Signal-to-noise ratio (|mean change| / spread)',
+                    cmap='YlOrBr', add_satellite=add_satellite)
+            except Exception as e:
+                print(f"⚠️ composite SNR grid for {var} failed: {e}")
                 traceback.print_exc()
     print(f"✅ Model agreement/sensitivity maps saved: {agreement_maps_made}")
 
