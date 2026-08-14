@@ -353,7 +353,7 @@
           <div class="two-col">
             <div>
               <label class="field">Start</label>
-              <input type="text" id="baseline-start" value="1990-01-01">
+              <input type="text" id="baseline-start" value="1995-01-01">
             </div>
             <div>
               <label class="field">End</label>
@@ -520,9 +520,8 @@ function initOptionsForm(){
   buildChoiceGrid('return-periods-grid', 'return_periods', RETURN_PERIOD_OPTIONS, [10,25,50,100]);
   buildChoiceGrid('wet-months-grid', 'wet_months', MONTH_OPTIONS, ['6','7','8','9']);
   buildChoiceGrid('dry-months-grid', 'dry_months', MONTH_OPTIONS, ['12','1','2']);
-  addIntervalRow('2026-01-01','2050-12-31','Near-century','2026-2050');  
-  addIntervalRow('2051-01-01','2075-12-31','Mid-century','2051-2075');
-  addIntervalRow('2076-01-01','2100-12-31','End-century','2076-2100');
+  addIntervalRow('2041-01-01','2060-12-31','Mid-century','2041-2060');
+  addIntervalRow('2081-01-01','2100-12-31','End-century','2081-2100');
 }
 window.addEventListener('load', initOptionsForm);
 
@@ -728,10 +727,23 @@ function buildStages(expected){
         // GEV bootstrap x every model/scenario/period, nothing printed in
         // between) which looked like a stall even though Colab was busy the
         // whole time. Heartbeat prints from main.py give real progress here.
-        const done = (log.match(/✅ .+ indices done \(\d+\/\d+\)/g)||[]).length;
-        const denom = Math.max(1, expected.ensembleMean); // one heartbeat per model/scenario/period, same shape as ensembleMean's count
+        //
+        // FIX: Baseline's own GEV bootstrap has no per-model "indices done"
+        // completion marker at all (it's a single reference dataset, not a
+        // per-model loop like the future scenario/period case), so it used
+        // to contribute ZERO progress movement for its entire duration --
+        // the bar (and, since the log wasn't growing either, the live log
+        // view) looked completely frozen for however long that took. Every
+        // gev_return_levels() call (Baseline included) now emits ~10 of its
+        // own "GEV bootstrap i/n" heartbeats as it runs, so count those
+        // directly instead of only whole-call completions -- this moves
+        // smoothly through Baseline's computation too, not just in a single
+        // jump once it finishes.
         if (/All scenario\/period indices computed/.test(log)) return 1;
-        return Math.min(0.98, done / denom);
+        const heartbeats = (log.match(/⏳ .+: GEV bootstrap \d+\/\d+/g)||[]).length;
+        const totalCalls = 1 + Math.max(1, expected.ensembleMean); // 1 Baseline call + one per future model/scenario/period
+        const denom = Math.max(1, totalCalls * 10); // ~10 heartbeats per call
+        return Math.min(0.98, heartbeats / denom);
       } },
     { label:'Writing Excel summaries', weight:10,
       done: log => /Template-style Excel report saved|Template-style Excel report failed/.test(log) },
