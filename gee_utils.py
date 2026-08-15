@@ -24,7 +24,28 @@ def _make_xee_projection(extent, scale):
     n_lon = int(np.ceil((lon_max - lon_min) / deg)) + 1
     n_lat = int(np.ceil((lat_max - lat_min) / deg)) + 1
     crs_transform = (deg, 0, lon_min, 0, -deg, lat_max)
-    return dict(crs='EPSG:4326', crs_transform=crs_transform, shape_2d=(n_lat, n_lon))
+    # FIX: xee's own docstring (EarthEngineStore.open, xee/ext.py) is explicit:
+    # "shape_2d: Output pixel grid shape as (width, height)". width=x=lon,
+    # height=y=lat. This was passing (n_lat, n_lon) -- swapped. Traced xee's
+    # internals to confirm this isn't just a display/array-order issue (the
+    # separate (lat,lon) vs (lon,lat) axis-order bug fixed earlier in
+    # plot_utils.py was real but different): get_variables() in xee/ext.py
+    # does `width, height = self.shape_2d` and then builds the LONGITUDE
+    # coordinate array (width_coord, from x_scale/x_translate) with `width`
+    # points, and the LATITUDE coordinate array (height_coord) with `height`
+    # points. With the swap, the longitude axis was sampled with n_lat
+    # points instead of n_lon, and the latitude axis with n_lon points
+    # instead of n_lat -- since AJK's bounding box isn't square (n_lat !=
+    # n_lon at any real scale), this doesn't just reorder axes, it changes
+    # which points get sampled: GEE was handed a genuinely different
+    # rectangular sampling grid than the one this function computed extent
+    # for, silently fetching data for the wrong region -- exactly the "lat
+    # lon flipped ... giving results for a different region" bug, and it
+    # originates here, in the ONE function both fetch_reference() and
+    # fetch_cmip6() call, so it affected every .nc file this pipeline has
+    # ever produced. This needs a full re-fetch, not just a re-plot — see
+    # the accompanying note on re-running with cached .nc files.
+    return dict(crs='EPSG:4326', crs_transform=crs_transform, shape_2d=(n_lon, n_lat))
 
 def _xee_open(ic_chunk, proj):
     ds = xr.open_dataset(ic_chunk, engine='ee', crs=proj['crs'],

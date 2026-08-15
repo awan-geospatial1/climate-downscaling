@@ -14,6 +14,48 @@ from agreement_utils import make_agreement_sensitivity_maps
 from template_excel_utils import write_template_style_excel
 from xclim import indices as xci
 
+# ── Shared spatial-map / composite-map config ───────────────────────────────
+# Pulled out to module level (instead of being defined inline inside
+# run_pipeline) so anything outside a live pipeline run — test_from_cache.py
+# in particular — can import the SAME idx_name -> (var, reducer) mapping and
+# the SAME idx_name -> (units, colormap, pct_change) config the real
+# pipeline uses, rather than hand-copying them and risking exactly the kind
+# of mismatch that's easy to introduce by hand (e.g. pairing a temperature
+# reducer like xci.tg_mean with precipitation data, which xclim correctly
+# rejects with a unit-validation error). One definition, two consumers.
+#
+# NOTE: reducers here must return a 2D (lat, lon) DataArray. The -273.15 on
+# every temperature reducer converts Kelvin (this pipeline's internal unit
+# throughout, per config.py's ref_units='K') to Celsius for DISPLAY only —
+# every delta/change computation subtracts two of these, so the constant
+# per-field offset cancels out and isn't affected either way.
+INDEX_MAP = {
+    'annual_mean_tas': ('tas', lambda da: xci.tg_mean(da, freq='YS').mean(dim='time') - 273.15),
+    'prcptot': ('pr', lambda da: xci.precip_accumulation(da, freq='YS').mean(dim='time')),
+    'annual_mean_tasmax': ('tasmax', lambda da: xci.tx_mean(da, freq='YS').mean(dim='time') - 273.15),
+    'annual_mean_tasmin': ('tasmin', lambda da: xci.tn_mean(da, freq='YS').mean(dim='time') - 273.15),
+    'rx1day': ('pr', lambda da: xci.max_1day_precipitation_amount(da, freq='YS').mean(dim='time')),
+}
+
+COMPOSITE_CFG = {
+    'annual_mean_tas': dict(pct_change=False, cmap_baseline='YlOrRd',
+                             var_title='Mean Temperature', unit_baseline='°C', unit_delta='°C'),
+    'annual_mean_tasmax': dict(pct_change=False, cmap_baseline='YlOrRd',
+                                var_title='Mean Max Temperature', unit_baseline='°C', unit_delta='°C'),
+    'annual_mean_tasmin': dict(pct_change=False, cmap_baseline='YlOrRd',
+                                var_title='Mean Min Temperature', unit_baseline='°C', unit_delta='°C'),
+    'prcptot': dict(pct_change=True, cmap_baseline='YlGnBu',
+                     var_title='Precipitation', unit_baseline='mm/year', unit_delta='%'),
+    'rx1day': dict(pct_change=True, cmap_baseline='YlGnBu',
+                    var_title='Max 1-Day Precipitation', unit_baseline='mm', unit_delta='%'),
+}
+
+# Agreement/sensitivity composites are keyed by raw variable name (tas, pr),
+# not idx_name, since agreement/spread/SNR are computed once per variable
+# (not once per derived index like INDEX_MAP above).
+AGREEMENT_COMPOSITE_CFG = {'tas': 'Mean Temperature', 'pr': 'Precipitation'}
+SENSITIVITY_UNITS = {'tas': '°C', 'tasmax': '°C', 'tasmin': '°C', 'pr': '% points'}
+
 
 def load_shapefile(shp_path, buffer_km):
     gdf = gpd.read_file(shp_path)
@@ -449,25 +491,7 @@ def run_pipeline(params):
 
     # ── Spatial maps ────────────────────────────────────────────────────
     # NOTE: reducers here must return a 2D (lat, lon) DataArray.
-    index_map = {
-        # FIX: tas/tasmax/tasmin are Kelvin end-to-end in this pipeline
-        # (config.py: ref_units='K', clip_min/max=200/350) — these reducers
-        # used to hand back raw Kelvin values with no conversion, which is
-        # exactly why the composite baseline panel showed ~263-292 labeled
-        # "°C". The -273.15 here only affects ABSOLUTE-value displays
-        # (baseline panel, individual annual_mean_tas*.png maps); every
-        # delta/change computation downstream (make_composite_grid_map,
-        # agreement_utils) subtracts two of these, so a constant per-field
-        # offset cancels out and was never affected by this bug.
-        'annual_mean_tas': ('tas', lambda da: xci.tg_mean(da, freq='YS').mean(dim='time') - 273.15),
-        'prcptot': ('pr', lambda da: xci.precip_accumulation(da, freq='YS').mean(dim='time')),
-        # Extremes — same reducer pattern (per-gridcell annual climatology),
-        # just different xclim functions. tasmax/tasmin capture hot/cold
-        # extremes, rx1day captures the wettest single day per year.
-        'annual_mean_tasmax': ('tasmax', lambda da: xci.tx_mean(da, freq='YS').mean(dim='time') - 273.15),
-        'annual_mean_tasmin': ('tasmin', lambda da: xci.tn_mean(da, freq='YS').mean(dim='time') - 273.15),
-        'rx1day': ('pr', lambda da: xci.max_1day_precipitation_amount(da, freq='YS').mean(dim='time')),
-    }
+    index_map = INDEX_MAP
 
     maps_made = 0
     maps_skipped = []
@@ -505,18 +529,7 @@ def run_pipeline(params):
     # and periods (3, 4, 5, ...) were actually selected — no code change
     # needed for a bigger run.
     period_order = [(tag, label) for (start, end, label, tag) in future_intervals]
-    composite_cfg = {
-        'annual_mean_tas': dict(pct_change=False, cmap_baseline='YlOrRd',
-                                 var_title='Mean Temperature', unit_baseline='°C', unit_delta='°C'),
-        'annual_mean_tasmax': dict(pct_change=False, cmap_baseline='YlOrRd',
-                                    var_title='Mean Max Temperature', unit_baseline='°C', unit_delta='°C'),
-        'annual_mean_tasmin': dict(pct_change=False, cmap_baseline='YlOrRd',
-                                    var_title='Mean Min Temperature', unit_baseline='°C', unit_delta='°C'),
-        'prcptot': dict(pct_change=True, cmap_baseline='YlGnBu',
-                         var_title='Precipitation', unit_baseline='mm/year', unit_delta='%'),
-        'rx1day': dict(pct_change=True, cmap_baseline='YlGnBu',
-                        var_title='Max 1-Day Precipitation', unit_baseline='mm', unit_delta='%'),
-    }
+    composite_cfg = COMPOSITE_CFG
     composite_maps_made = 0
     for idx_name, (var, reducer) in index_map.items():
         cfg_c = composite_cfg.get(idx_name)
@@ -569,8 +582,8 @@ def run_pipeline(params):
     # recomputed it independently for the same cell).
     from agreement_utils import compute_agreement_and_sensitivity_arrays
     agreement_maps_made = 0
-    agreement_composite_cfg = {'tas': 'Mean Temperature', 'pr': 'Precipitation'}
-    sensitivity_units = {'tas': '°C', 'tasmax': '°C', 'tasmin': '°C', 'pr': '% points'}
+    agreement_composite_cfg = AGREEMENT_COMPOSITE_CFG
+    sensitivity_units = SENSITIVITY_UNITS
     for var in variables:
         agreement_grids_2d = {s: {} for s in scenarios}
         spread_grids_2d = {s: {} for s in scenarios}
