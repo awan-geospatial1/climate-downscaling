@@ -143,6 +143,28 @@ def compute_agreement_array(var, scenario, tag, start, end, baseline_da, grids_b
     return base_clim.copy(data=agreement), used_models
 
 
+def compute_agreement_and_sensitivity_arrays(var, scenario, tag, start, end, baseline_da, grids_by_model):
+    """
+    One-shot version of compute_agreement_array that also returns spread
+    and SNR — for building the sensitivity-spread / sensitivity-SNR
+    composite grids (make_composite_metric_grid in plot_utils.py) without
+    paying for per_model_change_stack a second and third time on top of
+    what compute_agreement_array and make_agreement_sensitivity_maps
+    already computed separately for the same var/scenario/period.
+
+    Returns (agreement_da, spread_da, snr_da, used_models), or
+    (None, None, None, used_models) if fewer than 2 models were usable.
+    """
+    change_mode = 'percent' if var == 'pr' else 'absolute'
+    stack, used_models, base_clim = per_model_change_stack(
+        var, baseline_da, grids_by_model, start, end, change_mode)
+    if stack is None:
+        return None, None, None, used_models
+    agreement, spread, snr = compute_agreement_and_sensitivity(stack)
+    return (base_clim.copy(data=agreement), base_clim.copy(data=spread),
+            base_clim.copy(data=snr), used_models)
+
+
 def make_agreement_sensitivity_maps(var, cfg, scenario, tag, start, end, baseline_da,
                                      grids_by_model, geom_native, maps_dir,
                                      make_spatial_map_fn, add_satellite=False):

@@ -1,4 +1,5 @@
 import os
+import urllib.request
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -207,24 +208,95 @@ def _hatch_masked_region(ax, lon, lat, mask, proj, hatch='///', zorder=4):
         pass
 
 
-def _add_background(ax, add_satellite, tile_zoom):
-    """Satellite tiles if requested and reachable, else plain land/ocean fill.
-    Never raises — a background failure should not stop the map from saving.
-    """
-    if add_satellite:
+_SATELLITE_TILE_URL = ("https://server.arcgisonline.com/ArcGIS/rest/services/"
+                        "World_Imagery/MapServer/tile/{z}/{y}/{x}")
+_NATURAL_EARTH_TEST_URL = "https://naturalearth.s3.amazonaws.com/10m_physical/ne_10m_land.zip"
+_satellite_reachable_cache = {}
+_natural_earth_reachable_cache = {}
+
+
+def _url_reachable(url, cache, label, timeout=6):
+    """Shared one-time-per-URL, cached, synchronous reachability check —
+    see _satellite_tiles_reachable's docstring for why this has to happen
+    BEFORE calling add_image()/add_feature() at all, rather than trying to
+    catch a failure from either of them directly."""
+    if 'result' not in cache:
         try:
-            tiler = cimgt.GoogleTiles(
-                url="https://server.arcgisonline.com/ArcGIS/rest/services/"
-                    "World_Imagery/MapServer/tile/{z}/{y}/{x}",
-                desired_tile_form="RGB")
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                ok = resp.status == 200
+        except Exception as e:
+            print(f"⚠️ {label} unreachable ({e}); falling back.")
+            ok = False
+        cache['result'] = ok
+    return cache['result']
+
+
+def _satellite_tiles_reachable(timeout=6):
+    """
+    One-time, cached, synchronous reachability check for the satellite tile
+    server.
+
+    FIX: cartopy's ax.add_image(tiler, zoom) is LAZY by design (its own
+    docstring: "asked to retrieve an image ... at draw time") — it never
+    actually fetches a tile or raises at call time, only later inside
+    fig.savefig(). The try/except this module used to wrap around
+    add_image() was therefore dead code for network failures: verified by
+    reproducing it directly — add_image() returns cleanly every time, and a
+    blocked/rejected tile server (confirmed here with a live 403 Forbidden)
+    only ever surfaces as cartopy printing a warning internally *during*
+    savefig(), completely bypassing our fallback logic. The map still saves
+    "successfully" — just with no imagery and no warning surfaced to us —
+    exactly the silent "background imagery is not there" symptom. Checking
+    reachability explicitly, before ever calling add_image(), means the
+    plain-background fallback actually runs when tiles aren't available.
+    Cached at module level so this costs one request per run, not one per
+    subplot panel (a composite grid can have 6-16+ panels).
+    """
+    return _url_reachable(_SATELLITE_TILE_URL.format(z=0, y=0, x=0),
+                           _satellite_reachable_cache, 'Satellite tile server')
+
+
+def _natural_earth_reachable(timeout=6):
+    """
+    Same pattern, same reason, for the LAND/OCEAN fallback background.
+    ax.add_feature(cfeature.LAND, ...) is ALSO lazy — it registers a
+    FeatureArtist and only tries to download/parse the underlying Natural
+    Earth shapefile at draw time. Confirmed by reproducing it directly: a
+    try/except around add_feature() calls never even fires — the download
+    happens deep inside fig.savefig(), and if it fails there it takes the
+    whole figure down with it (an uncaught HTTPError/URLError), which is
+    exactly backwards for a function whose entire job is "never raise; this
+    is the FALLBACK path". Checking first means we can skip straight to the
+    always-available flat color instead of registering a feature that's
+    already known to be doomed.
+    """
+    return _url_reachable(_NATURAL_EARTH_TEST_URL, _natural_earth_reachable_cache, 'Natural Earth basemap data')
+
+
+def _add_background(ax, add_satellite, tile_zoom):
+    """Satellite tiles if requested and reachable, else plain land/ocean fill
+    if THAT'S reachable, else a flat solid color. Never raises — a
+    background failure should not stop the map from saving.
+    """
+    if add_satellite and _satellite_tiles_reachable():
+        try:
+            tiler = cimgt.GoogleTiles(url=_SATELLITE_TILE_URL, desired_tile_form="RGB")
             ax.add_image(tiler, tile_zoom)
             return
         except Exception as e:
             print(f"⚠️ Satellite tiles unavailable ({e}); falling back to plain background")
 
-    ax.set_facecolor('#dbe7f0')
-    ax.add_feature(cfeature.LAND, facecolor='#f2f0e8', zorder=0)
-    ax.add_feature(cfeature.OCEAN, facecolor='#dbe7f0', zorder=0)
+    if _natural_earth_reachable():
+        try:
+            ax.set_facecolor('#dbe7f0')
+            ax.add_feature(cfeature.LAND, facecolor='#f2f0e8', zorder=0)
+            ax.add_feature(cfeature.OCEAN, facecolor='#dbe7f0', zorder=0)
+            return
+        except Exception as e:
+            print(f"⚠️ Land/ocean background failed anyway ({e}); using a flat background color")
+
+    ax.set_facecolor('#f2f0e8')
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -384,7 +456,7 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
                              geom_native, districts_gdf, out_path,
                              var_title, unit_baseline, unit_delta,
                              cmap_baseline='YlOrRd', diverging_cmap='RdBu_r',
-                             pct_change=False, smooth_sigma=1.0,
+                             pct_change=False, smooth_sigma=1.0, robust_pct=90,
                              add_satellite=True, tile_zoom=8):
     """
     AJK-report-style composite: one large baseline panel (own colorbar) plus
@@ -393,6 +465,23 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
     Rows = scenario_order, columns = period_order — both are just lists, so
     this auto-sizes to however many periods were selected (3, 4, 5, ...)
     without any other change.
+
+    robust_pct : percentile of |delta| (pooled across every panel) used to
+                 set vmax. Extreme-value indices in particular (rx1day, and
+                 pct_change more generally, since dividing by a small
+                 baseline amplifies noise) can have a handful of genuinely
+                 large-but-real outlier cells; a loose percentile (e.g. the
+                 99.5 this used to default to) lets those few cells set a
+                 vmax so wide that every OTHER cell — the actual spatial
+                 pattern the map exists to show — gets compressed into a
+                 few percent of the colorbar and looks visually flat/near-
+                 white. Default of 90 trades a bit of outlier visibility
+                 (capped cells still show via the 'extend' arrow, so nothing
+                 is hidden) for much better contrast across the bulk of the
+                 region — verified empirically: at 99.5 every one of 6 test
+                 panels had pixel std ~12-25/255 (looked "empty"); at 90 the
+                 same data showed real, visible spatial contrast in every
+                 panel.
 
     baseline_da    : xr.DataArray (lat, lon) — ensemble-mean baseline field.
     scenario_grids : {scenario: {tag: xr.DataArray(lat, lon)}} — ensemble-mean
@@ -456,25 +545,17 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
             if finite.size:
                 all_finite_vals.append(finite)
 
-    # FIX: this used to clip vmax to the 98th percentile of |delta|, which
-    # meant the top ~2% of cells (by magnitude) got flattened into the
-    # colorbar's "extend" cap color instead of showing their real value —
-    # part of what produced the solid, undifferentiated dark-navy blocks in
-    # earlier renders. Switching to the true max sounds like the fix, but
-    # it isn't safe on its own: a single cell near the (now relative)
-    # masking threshold can still produce a huge-but-finite % change and
-    # wash out the whole scale (verified this empirically — see PR
-    # discussion). So: keep robust percentile clipping to protect the
-    # overall readability of the legend, but raise it from 98th to 99.5th
-    # (tighter than before) now that the improved relative masking above
-    # already screens out the near-zero-baseline cells that used to be the
-    # actual source of the extreme values being clipped in the first place.
-    # Genuinely extreme survivors are still shown via the 'extend' cap
-    # rather than silently — and masked (NaN) cells get hatched below
-    # rather than left blank, so nothing is invisible, even if a few
-    # outlier cells share one cap color.
+    # FIX: this used to clip vmax to a fixed 99.5th percentile of |delta|.
+    # See the robust_pct docstring note above — that was still loose enough
+    # for a handful of extreme cells to wash out contrast across the whole
+    # grid, confirmed empirically on the actual rx1day composite (pixel std
+    # of only ~12-25/255 in every single delta panel). Genuinely extreme
+    # survivors beyond robust_pct are still shown via the 'extend' cap
+    # rather than silently, and masked (NaN) cells get hatched below rather
+    # than left blank, so nothing is invisible — just capped more tightly
+    # so the real spatial pattern is visible instead of crushed to near-white.
     if all_finite_vals:
-        vmax = float(np.nanpercentile(np.abs(np.concatenate(all_finite_vals)), 99.5)) or 1.0
+        vmax = float(np.nanpercentile(np.abs(np.concatenate(all_finite_vals)), robust_pct)) or 1.0
     else:
         vmax = 1.0
     vmin = -vmax

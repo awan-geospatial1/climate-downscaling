@@ -136,8 +136,31 @@ def run_pipeline(params):
         _CFG[v]['chunks'] = chunks
 
     ref_cache = {}
+    ref_dir = os.path.join(out_dir, 'reference')
+    os.makedirs(ref_dir, exist_ok=True)
     for var in variables:
-        ref_cache[var] = fetch_reference(var, b_start, b_end, region, extent, _CFG[var])
+        # FIX: fetch_reference() was called unconditionally every run, with
+        # no caching -- unlike the corrected CMIP6 grids just below (which
+        # get saved to data_dir and can be reloaded), the reference dataset
+        # had to be re-fetched from GEE from scratch every single time, even
+        # when only testing/iterating on a downstream step (indices, Excel,
+        # plotting) that doesn't touch the reference data at all. Caching it
+        # to {out_dir}/reference/ref_{var}.nc means a second run against the
+        # same AOI/baseline period/output folder skips this fetch entirely --
+        # see test_from_cache.py for a standalone script that reuses this
+        # plus the already-cached corrected_grids .nc files to test any
+        # downstream step without touching GEE at all.
+        ref_path = os.path.join(ref_dir, f'ref_{var}.nc')
+        if os.path.exists(ref_path):
+            print(f"📂 Using cached reference for {var} → {ref_path}")
+            ref_cache[var] = {'ref': clean_time_attrs(xr.open_dataarray(ref_path).load())}
+        else:
+            ref_cache[var] = fetch_reference(var, b_start, b_end, region, extent, _CFG[var])
+            try:
+                clean_time_attrs(ref_cache[var]['ref']).load().to_netcdf(ref_path)
+                print(f"💾 Reference for {var} cached → {ref_path}")
+            except Exception as e:
+                print(f"⚠️ Could not cache reference for {var} ({e}); will re-fetch next run")
 
     qdm_cache = {v: {} for v in variables}
     hist_cache = {v: {} for v in variables}
