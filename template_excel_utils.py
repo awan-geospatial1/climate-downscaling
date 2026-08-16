@@ -44,16 +44,18 @@ comment nobody will find:
 import numpy as np
 import pandas as pd
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.chart import BarChart, LineChart, Reference
 from openpyxl.utils import get_column_letter
 
 from indices_utils import daily_spatial_series, daily_spatial_ensemble
 
-HEADER_FILL = PatternFill('solid', fgColor='1F4E78')
+HEADER_FILL = PatternFill('solid', fgColor='118D9E')
 HEADER_FONT = Font(color='FFFFFF', bold=True)
-SUBHEADER_FILL = PatternFill('solid', fgColor='D9E1F2')
+SUBHEADER_FILL = PatternFill('solid', fgColor='118D9E')
 CENTER = Alignment(horizontal='center', vertical='center')
+THIN_SIDE = Side(style='thin', color='BFBFBF')
+THIN_BORDER = Border(left=THIN_SIDE, right=THIN_SIDE, top=THIN_SIDE, bottom=THIN_SIDE)
 
 MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
                'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
@@ -107,6 +109,18 @@ def _style_header_row(ws, row, col_start, col_end):
         cell.fill = HEADER_FILL
         cell.font = HEADER_FONT
         cell.alignment = CENTER
+
+
+def _apply_borders(ws, min_row, max_row, min_col, max_col):
+    """Thin grey borders on every cell in the range — matches the
+    reference report's tables, which border every cell including the
+    plain data rows (not just headers). Added across the main summary
+    tables below; previously no border styling existed anywhere in this
+    file, which read as noticeably plainer/less finished than the
+    reference report's Excel-native table look."""
+    for r in range(min_row, max_row + 1):
+        for c in range(min_col, max_col + 1):
+            ws.cell(row=r, column=c).border = THIN_BORDER
 
 
 def _period_labels(future_intervals):
@@ -194,6 +208,82 @@ def _sheet_daily_spatial_averages(wb, variables, _cfg, scenarios, future_interva
 # =========================================================================
 # Sheet 2: Temperature Stats and Graphs
 # =========================================================================
+def _add_monthly_seasonality_block(ws, results, scenarios, periods, category_key, var_key,
+                                    row_start, y_axis_title, chart_title, chart_anchor_col):
+    """
+    Monthly climatology table + smoothed line chart: Baseline plus one line
+    per scenario/period, matching the reference report's monthly
+    seasonality charts (temperature and precipitation both have one).
+
+    FIX: monthly_mean_tas already existed as a computed index, but nothing
+    in this file ever laid it out as a table or charted it — and
+    monthly_mean_pr didn't exist at all until this same pass (see
+    indices_utils.py). Both variables get identical treatment here via
+    category_key ('temperature'/'precipitation') and var_key
+    ('monthly_mean_tas'/'monthly_mean_pr').
+    """
+    ws.cell(row=row_start, column=1, value='Month')
+    for j, m in enumerate(MONTH_NAMES):
+        ws.cell(row=row_start, column=2 + j, value=m)
+    _style_header_row(ws, row_start, 1, 1 + len(MONTH_NAMES))
+
+    row = row_start + 1
+    table_top = row
+
+    def write_monthly_row(label, monthly_list):
+        nonlocal row
+        ws.cell(row=row, column=1, value=label)
+        if monthly_list:
+            for j, v in enumerate(monthly_list[:12]):
+                if v is not None:
+                    ws.cell(row=row, column=2 + j, value=round(float(v), 2))
+        row += 1
+
+    base_stat = results.get('Baseline', {}).get(category_key, {}).get(var_key, {})
+    base_vals = base_stat.get('mean') if isinstance(base_stat, dict) else base_stat
+    write_monthly_row('Baseline', base_vals)
+
+    for scenario in scenarios:
+        for tag, label in periods:
+            stat = results.get(f'{scenario}_{tag}', {}).get(category_key, {}).get(var_key, {})
+            vals = stat.get('mean') if isinstance(stat, dict) else None
+            write_monthly_row(f'{scenario.upper()} {label}', vals)
+
+    table_bottom = row - 1
+    _apply_borders(ws, row_start, table_bottom, 1, 1 + len(MONTH_NAMES))
+
+    try:
+        chart = LineChart()
+        chart.title = chart_title
+        chart.y_axis.title = y_axis_title
+        chart.x_axis.title = 'Month'
+        chart.style = 2
+        # FIX: this used to start at table_top - 1 (the "Month/Jan/Feb/..."
+        # header row itself), which got misread as its own data series
+        # ("Month", flat at 0, since the month names aren't numbers) — a
+        # phantom line visible in the rendered chart. from_rows=True with
+        # titles_from_data pulls each row's own column-A value as that
+        # row's series title directly, so the header row must NOT be
+        # included in the data range at all -- start at table_top (the
+        # first real data row, "Baseline") instead.
+        data = Reference(ws, min_col=1, max_col=1 + len(MONTH_NAMES), min_row=table_top, max_row=table_bottom)
+        # from_rows=True: each ROW (Baseline, each scenario/period) is one
+        # series, months run across columns -- opposite orientation from
+        # every other chart in this file, which is why this needs its own
+        # Reference/add_data call instead of reusing the column-series helper
+        # pattern the totals charts above use.
+        chart.add_data(data, titles_from_data=True, from_rows=True)
+        cats = Reference(ws, min_col=2, max_col=1 + len(MONTH_NAMES), min_row=row_start, max_row=row_start)
+        chart.set_categories(cats)
+        for s in chart.series:
+            s.smooth = True
+        ws.add_chart(chart, f'{get_column_letter(chart_anchor_col)}{row_start}')
+    except Exception as e:
+        print(f"    [template-excel] monthly seasonality chart failed ({chart_title}): {e}")
+
+    return row + 2  # next free row, with a blank-row gap
+
+
 def _sheet_temperature_stats(wb, results, scenarios, future_intervals):
     ws = wb.create_sheet('Temperature Stats and Graphs')
     periods = _period_labels(future_intervals)
@@ -237,7 +327,8 @@ def _sheet_temperature_stats(wb, results, scenarios, future_intervals):
                 col += 1
         row += 1
 
-    ws.column_dimensions['A'].width = 22
+    _apply_borders(ws, 1, row - 1, 1, total_cols)
+    ws.column_dimensions['A'].width = 28
 
     # One simple bar chart comparing the three temperature variables'
     # annual means across all Baseline/scenario/period columns.
@@ -254,6 +345,11 @@ def _sheet_temperature_stats(wb, results, scenarios, future_intervals):
     except Exception as e:
         print(f"    [template-excel] temperature chart failed: {e}")
 
+    _add_monthly_seasonality_block(
+        ws, results, scenarios, periods, 'temperature', 'monthly_mean_tas',
+        row_start=row + 2, y_axis_title='\u00b0C',
+        chart_title='Monthly Mean Temperature — Baseline vs. Scenarios', chart_anchor_col=total_cols + 2)
+
 
 # =========================================================================
 # Sheet 3: Precipitation Stats and Graph
@@ -265,7 +361,7 @@ def _pick_threshold_key(precip_thresholds, target=20.0):
     return closest, f'wetdays_per_month_{closest:g}mm'
 
 
-def _sheet_precipitation_stats(wb, results, scenarios, future_intervals, precip_thresholds):
+def _sheet_precipitation_stats(wb, results, scenarios, future_intervals, precip_thresholds, return_periods=None):
     ws = wb.create_sheet('Precipitation Stats and Graph')
     periods = _period_labels(future_intervals)
 
@@ -277,12 +373,18 @@ def _sheet_precipitation_stats(wb, results, scenarios, future_intervals, precip_
     # workbook never actually reported annual/seasonal totals or the 1-day
     # extreme amount anywhere — the Temperature sheet has its summary block,
     # Precipitation didn't. Mirrors that same layout.
+    #
+    # FIX: added rx5day (was computed nowhere at all until this same pass —
+    # see indices_utils.py) and the GEV N-year return level, both present
+    # in the reference report's equivalent table but missing here.
     totals_specs = [
         ('prcptot', 'Total annual precipitation (mm)'),
         ('wet_season_total', 'Wet-season total (mm)'),
         ('dry_season_total', 'Dry-season total (mm)'),
         ('rx1day_mean', 'Max 1-day precipitation, mean (mm)'),
         ('rx1day_p90', 'Max 1-day precipitation, p90 (mm)'),
+        ('rx5day_mean', 'Max 5-day precipitation, mean (mm)'),
+        ('rx5day_p90', 'Max 5-day precipitation, p90 (mm)'),
     ]
     ws.cell(row=1, column=1, value='Spatial Average')
     ws.cell(row=1, column=2, value='Baseline')
@@ -316,21 +418,44 @@ def _sheet_precipitation_stats(wb, results, scenarios, future_intervals, precip_
                 col += 1
         row += 1
 
+    n_rows_in_table = len(totals_specs)
+    gev_T = None
+    if return_periods:
+        gev_T = 100 if 100 in return_periods else max(return_periods)
+        ws.cell(row=row, column=1, value=f'{gev_T}-year precipitation in 24-hour (mm)')
+        base_gev = results.get('Baseline', {}).get('precipitation', {}).get('gev_return_levels', {}).get(gev_T, {})
+        base_val = base_gev.get('mean') if isinstance(base_gev, dict) else None
+        ws.cell(row=row, column=2, value=round(base_val, 2) if base_val is not None else None)
+        col = 3
+        for scenario in scenarios:
+            for tag, _ in periods:
+                gev = results.get(f'{scenario}_{tag}', {}).get('precipitation', {}).get('gev_return_levels', {}).get(gev_T, {})
+                val = gev.get('mean') if isinstance(gev, dict) else None
+                ws.cell(row=row, column=col, value=round(val, 2) if val is not None else None)
+                col += 1
+        row += 1
+        n_rows_in_table += 1
+
+    _apply_borders(ws, 1, totals_anchor_row + n_rows_in_table - 1, 1, total_cols)
+
     try:
         chart = BarChart()
         chart.title = 'Spatial-average precipitation totals & extremes'
         chart.y_axis.title = 'mm'
         data = Reference(ws, min_col=2, max_col=total_cols, min_row=totals_anchor_row - 1,
-                          max_row=totals_anchor_row + len(totals_specs) - 1)
+                          max_row=totals_anchor_row + n_rows_in_table - 1)
         cats = Reference(ws, min_col=1, max_col=1, min_row=totals_anchor_row,
-                          max_row=totals_anchor_row + len(totals_specs) - 1)
+                          max_row=totals_anchor_row + n_rows_in_table - 1)
         chart.add_data(data, titles_from_data=True)
         chart.set_categories(cats)
         ws.add_chart(chart, f'{get_column_letter(total_cols + 2)}2')
     except Exception as e:
         print(f"    [template-excel] precipitation totals chart failed: {e}")
 
-    row_cursor = row + 2  # blank rows before the per-threshold wetdays blocks
+    row_cursor = _add_monthly_seasonality_block(
+        ws, results, scenarios, periods, 'precipitation', 'monthly_mean_pr',
+        row_start=row + 2, y_axis_title='mm',
+        chart_title='Monthly Mean Precipitation — Baseline vs. Scenarios', chart_anchor_col=total_cols + 2)
 
     if not precip_thresholds:
         ws.cell(row=row_cursor, column=1,
@@ -389,6 +514,7 @@ def _sheet_precipitation_stats(wb, results, scenarios, future_intervals, precip_
         except Exception as e:
             print(f"    [template-excel] precipitation chart ({thr:g}mm) failed: {e}")
 
+        _apply_borders(ws, header_row, chart_start_row + 11, 1, total_cols)
         row_cursor = chart_start_row + 12 + 3  # blank rows before next threshold's block
 
     ws.column_dimensions['A'].width = 30
@@ -481,6 +607,16 @@ def _sheet_helper(wb, scenarios, future_intervals, ref_cache, _cfg, corrected_gr
     ws.column_dimensions['A'].width = 14
 
 
+def _gumbel_return_level(u, alpha, T):
+    """x(T) = u - alpha * ln(-ln(1 - 1/T)) -- standard Gumbel EVI quantile
+    formula, using the same method-of-moments (u, alpha) already computed
+    by _gumbel_moments above, so this curve is consistent with the stat
+    block already in this sheet rather than a second, different estimate."""
+    if not np.isfinite(u) or not np.isfinite(alpha) or alpha <= 0:
+        return np.nan
+    return u - alpha * np.log(-np.log(1 - 1.0 / T))
+
+
 # =========================================================================
 # Sheet 6: Return Period Graphs (Gumbel method-of-moments)
 # =========================================================================
@@ -505,8 +641,10 @@ def _sheet_return_period(wb, scenarios, future_intervals, ref_cache, corrected_g
 
     STAT_ROWS = ['n', 'xbar', 'st. dev', 'alpha', 'u']
     col = 1
+    gumbel_params = []  # (label, u, alpha) -- reused below for the curve table
     for label, vals in blocks:
         stats = _gumbel_moments(vals)
+        gumbel_params.append((label, stats['u'], stats['alpha']))
         ws.cell(row=1, column=col, value=label)
         ws.cell(row=1, column=col).font = Font(bold=True)
         ws.cell(row=1, column=col).fill = SUBHEADER_FILL
@@ -519,6 +657,51 @@ def _sheet_return_period(wb, scenarios, future_intervals, ref_cache, corrected_g
             ws.cell(row=9 + r, column=col, value=round(float(v), 2))
         col += 3  # 2 cols for this block + 1 blank spacer
 
+    # ── Return-level curve table + chart ────────────────────────────────
+    # FIX: this sheet only ever stored the raw stats and annual-max series
+    # needed to BUILD a return-period curve by hand in Excel -- it never
+    # actually produced the curve or a chart, unlike the reference report's
+    # "Precipitation vs Return Period" line chart (smooth curve, 2-100
+    # years, one line per baseline/scenario-period). Fixed row 150 anchor:
+    # safely below any realistic annual-max series length (even a full
+    # 1990-2100 span is ~110 rows) so this never collides with the blocks
+    # above regardless of how many years of data they contain.
+    curve_row0 = 150
+    return_periods_curve = [2, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    ws.cell(row=curve_row0, column=1, value='Return Period (years)')
+    ws.cell(row=curve_row0, column=1).font = Font(bold=True)
+    for j, (label, u, alpha) in enumerate(gumbel_params):
+        ws.cell(row=curve_row0, column=2 + j, value=label)
+    _style_header_row(ws, curve_row0, 1, 1 + len(gumbel_params))
+
+    for i, T in enumerate(return_periods_curve):
+        r = curve_row0 + 1 + i
+        ws.cell(row=r, column=1, value=T)
+        for j, (label, u, alpha) in enumerate(gumbel_params):
+            val = _gumbel_return_level(u, alpha, T)
+            ws.cell(row=r, column=2 + j, value=round(val, 2) if np.isfinite(val) else None)
+
+    _apply_borders(ws, curve_row0, curve_row0 + len(return_periods_curve), 1, 1 + len(gumbel_params))
+
+    try:
+        chart = LineChart()
+        chart.title = 'Precipitation vs. Return Period'
+        chart.y_axis.title = 'Precipitation (mm)'
+        chart.x_axis.title = 'Return Period (Years)'
+        chart.style = 2
+        n_blocks = len(gumbel_params)
+        data = Reference(ws, min_col=2, max_col=1 + n_blocks,
+                          min_row=curve_row0, max_row=curve_row0 + len(return_periods_curve))
+        cats = Reference(ws, min_col=1, max_col=1,
+                          min_row=curve_row0 + 1, max_row=curve_row0 + len(return_periods_curve))
+        chart.add_data(data, titles_from_data=True)
+        chart.set_categories(cats)
+        for s in chart.series:
+            s.smooth = True
+        ws.add_chart(chart, f'{get_column_letter(2 + n_blocks + 1)}{curve_row0}')
+    except Exception as e:
+        print(f"    [template-excel] return-period curve chart failed: {e}")
+
     ws.column_dimensions['A'].width = 12
 
 
@@ -526,14 +709,14 @@ def _sheet_return_period(wb, scenarios, future_intervals, ref_cache, corrected_g
 # Entry point
 # =========================================================================
 def write_template_style_excel(out_path, variables, _cfg, scenarios, future_intervals,
-                                ref_cache, corrected_grids, results, precip_thresholds):
+                                ref_cache, corrected_grids, results, precip_thresholds, return_periods=None):
     wb = Workbook()
     wb.remove(wb.active)  # drop the default empty sheet
 
     _sheet_daily_spatial_averages(wb, variables, _cfg, scenarios, future_intervals,
                                    ref_cache, corrected_grids)
     _sheet_helper(wb, scenarios, future_intervals, ref_cache, _cfg, corrected_grids)
-    _sheet_precipitation_stats(wb, results, scenarios, future_intervals, precip_thresholds)
+    _sheet_precipitation_stats(wb, results, scenarios, future_intervals, precip_thresholds, return_periods)
     _sheet_max_precip(wb, scenarios, future_intervals, ref_cache, corrected_grids)
     _sheet_return_period(wb, scenarios, future_intervals, ref_cache, corrected_grids)
     _sheet_temperature_stats(wb, results, scenarios, future_intervals)

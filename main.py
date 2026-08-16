@@ -459,7 +459,7 @@ def run_pipeline(params):
     try:
         template_path = os.path.join(tables_dir, 'template_style_report.xlsx')
         write_template_style_excel(template_path, variables, _CFG, scenarios, future_intervals,
-                                    ref_cache, corrected_grids, results, precip_thresholds)
+                                    ref_cache, corrected_grids, results, precip_thresholds, return_periods)
         print(f"✅ Template-style Excel report saved: {template_path}")
     except Exception as e:
         print(f"⚠️ Template-style Excel report failed: {e}")

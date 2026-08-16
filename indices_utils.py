@@ -93,12 +93,26 @@ def compute_precipitation_indices(pr_da, start, end, precip_thresholds, wet_mont
     dry = pr_1d.sel(time=pr_1d['time.month'].isin(dry_months))
     out['wet_season_total'] = float(xci.precip_accumulation(wet, freq='YS').mean())
     out['dry_season_total'] = float(xci.precip_accumulation(dry, freq='YS').mean())
+    # FIX: monthly precipitation climatology was never computed — tas had
+    # its monthly_mean_tas (used for the temperature seasonality chart) but
+    # there was no precipitation equivalent, so a monthly precip
+    # seasonality chart had no data source to plot from.
+    monthly_precip = xci.precip_accumulation(pr_1d, freq='MS')
+    out['monthly_mean_pr'] = monthly_precip.groupby('time.month').mean().values.tolist()
     for thr in precip_thresholds:
         cnt = xci.wetdays(pr_1d, thresh=f'{thr} mm/day', freq='MS')
         out[f'wetdays_per_month_{thr:g}mm'] = cnt.groupby('time.month').mean().values.tolist()
     rx1_annual = xci.max_1day_precipitation_amount(pr_1d, freq='YS')
     out['rx1day_mean'] = float(rx1_annual.mean())
     out['rx1day_p90'] = float(rx1_annual.quantile(0.90))
+    # FIX: rx5day (5-day max precipitation) was referenced in main.py's
+    # headline_stat dict but never actually computed anywhere — a report
+    # table asking for "5-Day Maximum Precipitation" had no real data
+    # behind it. xci.max_n_day_precipitation_amount(window=5) is the
+    # standard xclim index for this (same pattern as rx1day's window=1).
+    rx5_annual = xci.max_n_day_precipitation_amount(pr_1d, window=5, freq='YS')
+    out['rx5day_mean'] = float(rx5_annual.mean())
+    out['rx5day_p90'] = float(rx5_annual.quantile(0.90))
     out['gev_return_levels'] = gev_return_levels(rx1_annual.values, return_periods, n_boot,
                                                   progress_label=progress_label)
     return out
