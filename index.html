@@ -706,6 +706,19 @@ function computeExpectedCounts(paramsObj){
     ensembleMean: nVars * nScenarios * nIntervals,
     ensembleMax: 1 * nScenarios * nIntervals,
     scenarioTables: nScenarios,
+    // FIX: the "Computing indices" stage below used to reuse
+    // ensembleMean (nVars * nScenarios * nIntervals = 4 * ...) as its
+    // denominator, but GEV bootstrap only ever runs inside
+    // compute_precipitation_indices() — once per MODEL per
+    // scenario/period, for pr only, never for tas/tasmax/tasmin (see
+    // main.py: compute_temperature_indices never calls gev_return_levels).
+    // The real count is nModels * nScenarios * nIntervals (+1 for
+    // Baseline), which doesn't even scale the same way as nVars unless
+    // nModels happens to equal 4 — with 2 models this made the expected
+    // denominator ~2x too large, so the bar crept along at roughly half
+    // the speed it should have and could sit well under 100% long after
+    // this stage actually finished.
+    gevCalls: nModels * nScenarios * nIntervals + 1,
   };
 }
 
@@ -731,7 +744,7 @@ function buildStages(expected){
         // between) which looked like a stall even though Colab was busy the
         // whole time. Heartbeat prints from main.py give real progress here.
         //
-        // FIX: Baseline's own GEV bootstrap has no per-model "indices done"
+        // Baseline's own GEV bootstrap has no per-model "indices done"
         // completion marker at all (it's a single reference dataset, not a
         // per-model loop like the future scenario/period case), so it used
         // to contribute ZERO progress movement for its entire duration --
@@ -744,8 +757,7 @@ function buildStages(expected){
         // jump once it finishes.
         if (/All scenario\/period indices computed/.test(log)) return 1;
         const heartbeats = (log.match(/⏳ .+: GEV bootstrap \d+\/\d+/g)||[]).length;
-        const totalCalls = 1 + Math.max(1, expected.ensembleMean); // 1 Baseline call + one per future model/scenario/period
-        const denom = Math.max(1, totalCalls * 10); // ~10 heartbeats per call
+        const denom = Math.max(1, expected.gevCalls * 10); // ~10 heartbeats per call, see gevCalls above
         return Math.min(0.98, heartbeats / denom);
       } },
     { label:'Writing Excel summaries', weight:10,

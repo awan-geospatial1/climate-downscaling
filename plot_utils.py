@@ -1,4 +1,5 @@
 import os
+import time
 import urllib.request
 import numpy as np
 import pandas as pd
@@ -222,12 +223,23 @@ _NATURAL_EARTH_TEST_URL = "https://naturalearth.s3.amazonaws.com/10m_physical/ne
 _satellite_reachable_cache = {}
 _natural_earth_reachable_cache = {}
 
+try:
+    import contextily as ctx
+    _CONTEXTILY_AVAILABLE = True
+except ImportError:
+    _CONTEXTILY_AVAILABLE = False
+
+_BASEMAP_MAX_RETRIES = 4
+_BASEMAP_RETRY_BACKOFF_SEC = 1.5
+_TILE_CACHE_DIR = os.path.join(os.path.expanduser('~'), '.climate_downscaling_tile_cache')
+_tile_cache_dir_ready = False
+
 
 def _url_reachable(url, cache, label, timeout=6):
     """Shared one-time-per-URL, cached, synchronous reachability check —
-    see _satellite_tiles_reachable's docstring for why this has to happen
-    BEFORE calling add_image()/add_feature() at all, rather than trying to
-    catch a failure from either of them directly."""
+    used by the fallback tiers below (cartopy tiles, then Natural Earth
+    land/ocean) since both of THOSE are lazy at draw-time — see their
+    call sites' comments."""
     if 'result' not in cache:
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -241,66 +253,16 @@ def _url_reachable(url, cache, label, timeout=6):
 
 
 def _satellite_tiles_reachable(timeout=6):
-    """
-    One-time, cached, synchronous reachability check for the satellite tile
-    server.
-
-    FIX: cartopy's ax.add_image(tiler, zoom) is LAZY by design (its own
-    docstring: "asked to retrieve an image ... at draw time") — it never
-    actually fetches a tile or raises at call time, only later inside
-    fig.savefig(). The try/except this module used to wrap around
-    add_image() was therefore dead code for network failures: verified by
-    reproducing it directly — add_image() returns cleanly every time, and a
-    blocked/rejected tile server (confirmed here with a live 403 Forbidden)
-    only ever surfaces as cartopy printing a warning internally *during*
-    savefig(), completely bypassing our fallback logic. The map still saves
-    "successfully" — just with no imagery and no warning surfaced to us —
-    exactly the silent "background imagery is not there" symptom. Checking
-    reachability explicitly, before ever calling add_image(), means the
-    plain-background fallback actually runs when tiles aren't available.
-    Cached at module level so this costs one request per run, not one per
-    subplot panel (a composite grid can have 6-16+ panels).
-    """
     return _url_reachable(_SATELLITE_TILE_URL.format(z=0, y=0, x=0),
                            _satellite_reachable_cache, 'Satellite tile server')
 
 
 def _natural_earth_reachable(timeout=6):
-    """
-    Same pattern, same reason, for the LAND/OCEAN fallback background.
-    ax.add_feature(cfeature.LAND, ...) is ALSO lazy — it registers a
-    FeatureArtist and only tries to download/parse the underlying Natural
-    Earth shapefile at draw time. Confirmed by reproducing it directly: a
-    try/except around add_feature() calls never even fires — the download
-    happens deep inside fig.savefig(), and if it fails there it takes the
-    whole figure down with it (an uncaught HTTPError/URLError), which is
-    exactly backwards for a function whose entire job is "never raise; this
-    is the FALLBACK path". Checking first means we can skip straight to the
-    always-available flat color instead of registering a feature that's
-    already known to be doomed.
-    """
     return _url_reachable(_NATURAL_EARTH_TEST_URL, _natural_earth_reachable_cache, 'Natural Earth basemap data')
 
 
-def _add_background(ax, add_satellite, tile_zoom):
-    """Satellite tiles if requested and reachable, else plain land/ocean fill
-    if THAT'S reachable, else a flat solid color. Never raises — a
-    background failure should not stop the map from saving.
-    """
-    if add_satellite and _satellite_tiles_reachable():
-        try:
-            # cache=True: a composite grid can have 6-16+ panels that all
-            # show nearly the same AJK extent at the same zoom, so most
-            # tiles are identical across panels. Without caching, cartopy
-            # re-requests every one of those tiles from scratch per panel —
-            # slower, and more exposed to transient failures/rate limits on
-            # a real tile server than it needs to be.
-            tiler = cimgt.GoogleTiles(url=_SATELLITE_TILE_URL, desired_tile_form="RGB", cache=True)
-            ax.add_image(tiler, tile_zoom)
-            return
-        except Exception as e:
-            print(f"⚠️ Satellite tiles unavailable ({e}); falling back to plain background")
-
+def _plain_background(ax):
+    """Land/ocean fill if Natural Earth is reachable, else a flat color."""
     if _natural_earth_reachable():
         try:
             ax.set_facecolor('#dbe7f0')
@@ -309,8 +271,69 @@ def _add_background(ax, add_satellite, tile_zoom):
             return
         except Exception as e:
             print(f"⚠️ Land/ocean background failed anyway ({e}); using a flat background color")
-
     ax.set_facecolor('#f2f0e8')
+
+
+def _add_background(ax, add_satellite, tile_zoom):
+    """Satellite tiles if requested and available, else plain land/ocean
+    fill if THAT'S reachable, else a flat solid color. Never raises — a
+    background failure should not stop the map from saving.
+
+    FIX: switched the primary method from driving cartopy's
+    ax.add_image(tiler, zoom) directly to contextily's ax.add_basemap(),
+    matching the approach in the working ajk_climate_maps.ipynb reference.
+    This isn't just a style preference — it fixes a real mechanism problem:
+    cartopy's add_image() is LAZY (its own docstring: images are fetched
+    "at draw time", i.e. deep inside fig.savefig(), not when add_image() is
+    called), so a try/except wrapped around it is dead code for network
+    failures — confirmed earlier by reproducing it directly against a
+    blocked tile server: add_image() returned cleanly every time, and the
+    real HTTP 403 only ever surfaced as a warning cartopy printed
+    internally during savefig(), never as a catchable exception. The
+    reachability-check workaround below (still kept, as a secondary
+    fallback) works around that, but contextily's ctx.add_basemap() sidesteps
+    the whole problem: it fetches tiles SYNCHRONOUSLY and raises immediately
+    on failure, right here, so a normal try/except actually works — which is
+    also what makes the retry-with-backoff loop below meaningful (retrying
+    something that fails silently at an unreachable point isn't real retry
+    logic; retrying something that raises where you're standing is).
+    """
+    if not add_satellite:
+        _plain_background(ax)
+        return
+
+    if _CONTEXTILY_AVAILABLE:
+        global _tile_cache_dir_ready
+        if not _tile_cache_dir_ready:
+            os.makedirs(_TILE_CACHE_DIR, exist_ok=True)
+            ctx.set_cache_dir(_TILE_CACHE_DIR)
+            _tile_cache_dir_ready = True
+
+        last_err = None
+        for attempt in range(1, _BASEMAP_MAX_RETRIES + 1):
+            try:
+                ctx.add_basemap(ax, crs='EPSG:4326', source=ctx.providers.Esri.WorldImagery,
+                                 attribution=False, reset_extent=False)
+                return
+            except Exception as e:
+                last_err = e
+                if attempt < _BASEMAP_MAX_RETRIES:
+                    time.sleep(_BASEMAP_RETRY_BACKOFF_SEC * attempt)
+        print(f"⚠️ contextily basemap failed after {_BASEMAP_MAX_RETRIES} attempts ({last_err}); "
+              f"trying cartopy tiles...")
+
+    # Fallback: cartopy tiles, only attempted if reachable (see the lazy/
+    # draw-time note above for why a bare try/except around add_image()
+    # alone wouldn't catch a failure here).
+    if _satellite_tiles_reachable():
+        try:
+            tiler = cimgt.GoogleTiles(url=_SATELLITE_TILE_URL, desired_tile_form="RGB", cache=True)
+            ax.add_image(tiler, tile_zoom)
+            return
+        except Exception as e:
+            print(f"⚠️ Satellite tiles unavailable ({e}); falling back to plain background")
+
+    _plain_background(ax)
 
 
 # ──────────────────────────────────────────────────────────────────────────
