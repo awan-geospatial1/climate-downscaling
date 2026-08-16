@@ -105,6 +105,13 @@ def run_pipeline(params):
     chunks = params.get('chunks_latlon', DEFAULT_CHUNKS_LATLON)
     out_dir = params['output_dir']
     add_satellite = params.get('add_satellite_basemap', False)
+    # FIX: every composite map title had "AJK" hard-coded directly in
+    # plot_utils.py/main.py f-strings — fine for this one region, wrong the
+    # moment this pipeline runs against anywhere else. index.html's job
+    # submission form doesn't send this field yet (nothing to send), so the
+    # 'AJK' default here preserves today's behavior exactly until that's
+    # added; passing region_name explicitly in params overrides it.
+    region_name = params.get('region_name', 'AJK')
 
     headline_stat = params.get('headline_stat', {
         'annual_mean_tas': 'mean', 'annual_mean_tasmax': 'mean',
@@ -556,7 +563,7 @@ def run_pipeline(params):
             make_composite_grid_map(
                 baseline_2d, scenario_grids_2d, scenarios, period_order,
                 geom_native, districts_gdf, composite_path,
-                add_satellite=add_satellite, **cfg_c)
+                region_name=region_name, add_satellite=add_satellite, **cfg_c)
             composite_maps_made += 1
         except Exception as e:
             print(f"⚠️ composite grid map for {idx_name} failed: {e}")
@@ -635,7 +642,7 @@ def run_pipeline(params):
                     agreement_grids_2d, scenarios, period_order,
                     geom_native, districts_gdf,
                     os.path.join(graphs_dir, f'composite_{var}_model_agreement.png'),
-                    var_title=var_title, add_satellite=add_satellite)
+                    var_title=var_title, region_name=region_name, add_satellite=add_satellite)
             except Exception as e:
                 print(f"⚠️ composite agreement grid for {var} failed: {e}")
                 traceback.print_exc()
@@ -644,7 +651,7 @@ def run_pipeline(params):
                     spread_grids_2d, scenarios, period_order,
                     geom_native, districts_gdf,
                     os.path.join(graphs_dir, f'composite_{var}_sensitivity_spread.png'),
-                    title_line1=f'{var_title} \u2014 Sensitivity: Inter-Model Spread \u2014 AJK',
+                    title_line1=f'{var_title} \u2014 Sensitivity: Inter-Model Spread \u2014 {region_name}',
                     colorbar_label=f'Std. dev. across models ({unit})' if unit else 'Std. dev. across models',
                     cmap='Purples', add_satellite=add_satellite)
             except Exception as e:
@@ -655,7 +662,7 @@ def run_pipeline(params):
                     snr_grids_2d, scenarios, period_order,
                     geom_native, districts_gdf,
                     os.path.join(graphs_dir, f'composite_{var}_sensitivity_snr.png'),
-                    title_line1=f'{var_title} \u2014 Sensitivity: Signal-to-Noise Ratio \u2014 AJK',
+                    title_line1=f'{var_title} \u2014 Sensitivity: Signal-to-Noise Ratio \u2014 {region_name}',
                     colorbar_label='Signal-to-noise ratio (|mean change| / spread)',
                     cmap='YlOrBr', add_satellite=add_satellite)
             except Exception as e:

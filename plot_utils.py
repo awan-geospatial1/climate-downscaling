@@ -44,7 +44,15 @@ def annual_series_from_grids(hist_cache, corrected_grids, var, scenario=None, ta
             da = corrected_grids.get(var, {}).get(scenario, {}).get(tag, {}).get(model)
         if da is None:
             continue
-        annual = (xci.tg_mean(spatial_mean(da), freq='YS') if var != 'pr'
+        # FIX: tas/tasmax/tasmin are Kelvin end-to-end in this pipeline
+        # (config.py: ref_units='K') — this reducer fed the fan chart with
+        # raw Kelvin values with no conversion. main.py's INDEX_MAP got the
+        # -273.15 fix earlier, but that only covers the spatial/composite
+        # maps built in main.py; this is a SEPARATE reducer used only by
+        # plot_fan_chart, and it was never touched by that fix. Confirmed by
+        # grep: this was the only remaining place computing annual tas means
+        # without the Kelvin->Celsius conversion.
+        annual = (xci.tg_mean(spatial_mean(da), freq='YS') - 273.15 if var != 'pr'
                   else xci.precip_accumulation(spatial_mean(da), freq='YS'))
         out[model] = (annual['time'].dt.year.values, annual.values)
     return out
@@ -281,7 +289,13 @@ def _add_background(ax, add_satellite, tile_zoom):
     """
     if add_satellite and _satellite_tiles_reachable():
         try:
-            tiler = cimgt.GoogleTiles(url=_SATELLITE_TILE_URL, desired_tile_form="RGB")
+            # cache=True: a composite grid can have 6-16+ panels that all
+            # show nearly the same AJK extent at the same zoom, so most
+            # tiles are identical across panels. Without caching, cartopy
+            # re-requests every one of those tiles from scratch per panel —
+            # slower, and more exposed to transient failures/rate limits on
+            # a real tile server than it needs to be.
+            tiler = cimgt.GoogleTiles(url=_SATELLITE_TILE_URL, desired_tile_form="RGB", cache=True)
             ax.add_image(tiler, tile_zoom)
             return
         except Exception as e:
@@ -361,13 +375,31 @@ def plot_index_comparison(df, index_name, out_path, ylabel=None):
 
 
 def make_spatial_map(index_da_2d, geom_native, out_path, title, cmap='viridis',
-                      smooth_sigma=1.0, add_satellite=False, tile_zoom=8):
+                      smooth_sigma=1.0, add_satellite=False, tile_zoom=8,
+                      vmin=None, vmax=None, robust_pct=2):
     """
     Render one clipped, smoothed spatial map from an in-memory (lat, lon)
     DataArray and save it to out_path.
 
     index_da_2d : xr.DataArray with dims ('lat', 'lon')
     geom_native : shapely Polygon/MultiPolygon (unbuffered AOI, EPSG:4326)
+    vmin/vmax   : pass both for a fixed scale. Leave both None (default) for
+                  a robust auto-range: the [robust_pct, 100-robust_pct]
+                  percentile of the field's own finite values, instead of
+                  the true min/max.
+
+                  FIX: this used to always auto-range to the exact min/max
+                  with zero outlier protection — for precipitation indices
+                  in particular (rx1day, prcptot), a single extreme cell
+                  (e.g. one wet-season outlier, or a near-zero-baseline
+                  edge cell elsewhere in the pipeline) could stretch the
+                  whole scale so far that every OTHER cell compressed into
+                  a sliver near one end, looking flat/empty — the same
+                  "absurd range, no visible pattern" failure mode already
+                  fixed for the composite grids (make_composite_grid_map),
+                  but this is a separate function and never got that fix.
+                  Extreme survivors are still shown via 'extend', not
+                  hidden.
     """
     # FIX: sortby() does not guarantee axis ORDER, only sort direction along
     # each named axis — the reducers upstream (e.g. xci.tg_mean(da).mean
@@ -383,6 +415,16 @@ def make_spatial_map(index_da_2d, geom_native, out_path, title, cmap='viridis',
     lat = da['lat'].values
     vals_smooth = _smooth_field(da.values, sigma=smooth_sigma)
 
+    if vmin is None or vmax is None:
+        finite = vals_smooth[np.isfinite(vals_smooth)]
+        if finite.size:
+            vmin = float(np.nanpercentile(finite, robust_pct))
+            vmax = float(np.nanpercentile(finite, 100 - robust_pct))
+        else:
+            vmin, vmax = 0.0, 1.0
+        if vmin == vmax:  # flat field -- avoid a degenerate zero-width range
+            vmin, vmax = vmin - 0.5, vmax + 0.5
+
     shp = gpd.GeoSeries([geom_native], crs='EPSG:4326')
     minx, miny, maxx, maxy = shp.total_bounds
     buf = 0.25
@@ -395,7 +437,7 @@ def make_spatial_map(index_da_2d, geom_native, out_path, title, cmap='viridis',
 
     _add_background(ax, add_satellite, tile_zoom)
 
-    cf = ax.contourf(lon, lat, vals_smooth, levels=60, cmap=cmap,
+    cf = ax.contourf(lon, lat, vals_smooth, levels=np.linspace(vmin, vmax, 61), cmap=cmap,
                       transform=proj, extend='both', zorder=3)
 
     # Clip strictly to the AOI polygon.
@@ -427,6 +469,7 @@ def make_spatial_map(index_da_2d, geom_native, out_path, title, cmap='viridis',
     gl.right_labels = False
 
     cb = fig.colorbar(cf, ax=ax, shrink=0.85, pad=0.03)
+    cb.set_ticks(_nice_ticks(vmin, vmax))
     cb.ax.tick_params(labelsize=9)
 
     ax.set_title(title, fontsize=11, fontweight='bold')
@@ -457,7 +500,7 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
                              var_title, unit_baseline, unit_delta,
                              cmap_baseline='YlOrRd', diverging_cmap='RdBu_r',
                              pct_change=False, smooth_sigma=1.0, robust_pct=90,
-                             add_satellite=True, tile_zoom=8):
+                             region_name='AJK', add_satellite=True, tile_zoom=8):
     """
     AJK-report-style composite: one large baseline panel (own colorbar) plus
     a grid of scenario x period change panels sharing one diverging colorbar.
@@ -585,7 +628,7 @@ def make_composite_grid_map(baseline_da, scenario_grids, scenario_order, period_
                            wspace=0.05, hspace=0.15, top=top_frac, bottom=0.08)
 
     change_word = '% change' if pct_change else 'change'
-    fig.suptitle(f'{var_title} — AJK', fontsize=13, fontweight='bold',
+    fig.suptitle(f'{var_title} — {region_name}', fontsize=13, fontweight='bold',
                  y=1 - (0.32 / fig_h_total))
     scenario_label = ' vs '.join(s.upper() for s in scenario_order)
     fig.text(0.5, 1 - (0.65 / fig_h_total),
@@ -804,7 +847,7 @@ def make_composite_metric_grid(value_grids, scenario_order, period_order,
 
 def make_composite_agreement_grid(agreement_grids, scenario_order, period_order,
                                    geom_native, districts_gdf, out_path,
-                                   var_title, add_satellite=True, tile_zoom=8,
+                                   var_title, region_name='AJK', add_satellite=True, tile_zoom=8,
                                    vmin=20, vmax=100):
     """
     AJK-report-style model-agreement composite — thin wrapper over
@@ -814,6 +857,6 @@ def make_composite_agreement_grid(agreement_grids, scenario_order, period_order,
     """
     make_composite_metric_grid(
         agreement_grids, scenario_order, period_order, geom_native, districts_gdf,
-        out_path, title_line1=f'{var_title} — Model Agreement — AJK',
+        out_path, title_line1=f'{var_title} — Model Agreement — {region_name}',
         colorbar_label='% of models agreeing on direction', cmap='RdYlGn',
         vmin=vmin, vmax=vmax, extend='both', add_satellite=add_satellite, tile_zoom=tile_zoom)

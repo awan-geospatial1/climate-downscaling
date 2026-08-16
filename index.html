@@ -332,6 +332,8 @@
               <input type="text" id="buffer-km" value="25">
             </div>
           </div>
+          <label class="field" style="margin-top:12px;">Region name (shown in map titles, e.g. "Precipitation — change relative to baseline")</label>
+          <input type="text" id="region-name" placeholder="AJK" value="AJK">
         </div>
 
         <div class="field-group">
@@ -577,6 +579,7 @@ function buildParamsObject(){
   const params = {
     gee_project_id: geeProject,
     buffer_km: Number(document.getElementById('buffer-km').value) || 25,
+    region_name: document.getElementById('region-name').value.trim() || 'AJK',
     models,
     scenarios,
     baseline_start: document.getElementById('baseline-start').value.trim(),
